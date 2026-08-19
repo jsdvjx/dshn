@@ -229,6 +229,7 @@ describe('multi-device routing', () => {
     const res = await request(port, '/', { cookie: session, accept: 'text/html' })
     expect(res.body).toBe('A2') // …and the new one serves
     again.ws.close()
+    await untilDevices(port, session, (x) => x.live === 0) // settle before the next test
   })
 
   it('keeps the legacy one-agent-per-subdomain behavior for agents without a device id', async () => {
@@ -240,5 +241,58 @@ describe('multi-device routing', () => {
     const res = await request(port, '/', { cookie: session, accept: 'text/html' })
     expect(res.body).toBe('L2')
     legacy2.ws.close()
+    await untilDevices(port, session, (x) => x.live === 0)
+  })
+
+  it('mixes a legacy agent with a device-id agent as two devices', async () => {
+    const modern = new FakeAgent(port, { subdomain: SUB, password: PASSWORD, deviceId: 'deva', device: 'Laptop A' }, 'A3')
+    await modern.ready
+    const legacy = new FakeAgent(port, { subdomain: SUB, password: PASSWORD }, 'L')
+    await legacy.ready
+    const j = await untilDevices(port, session, (x) => x.live === 2)
+    expect(j.multi).toBe(true)
+    expect(j.devices.filter((d: any) => d.online).map((d: any) => d.id).sort()).toEqual(['deva', 'device'])
+    // Unselected API traffic stays on the longest-connected device (the modern one).
+    const api = await request(port, '/api/x', { cookie: session, accept: 'application/json' })
+    expect(api.body).toBe('A3')
+    modern.ws.close()
+    legacy.ws.close()
+    await untilDevices(port, session, (x) => x.live === 0)
+  })
+
+  it('keeps the device endpoints behind the login gate', async () => {
+    const list = await request(port, '/__dshn/devices', { accept: 'application/json' })
+    expect(list.body).toContain('Access password') // the login page, not JSON
+    expect(list.headers['content-type']).toContain('text/html')
+    const sel = await request(port, '/__dshn/select', {
+      method: 'POST', contentType: 'application/json', accept: 'application/json',
+      body: JSON.stringify({ device: 'deva' }),
+    })
+    expect(sel.headers['set-cookie']).toBeUndefined()
+    expect(sel.body).toContain('Access password')
+  })
+
+  it('rejects malformed device ids without consulting the store', async () => {
+    for (const device of ['UPPER', 'a b', 'x'.repeat(80), '../../etc', '<img>', '', 42, null]) {
+      const sel = await request(port, '/__dshn/select', {
+        method: 'POST', cookie: session, contentType: 'application/json',
+        accept: 'application/json', body: JSON.stringify({ device }),
+      })
+      expect(sel.status, `device=${String(device)}`).toBe(400)
+    }
+  })
+
+  it('escapes hostile device names in the picker HTML', async () => {
+    const evil = new FakeAgent(port, {
+      subdomain: SUB, password: PASSWORD, deviceId: 'evil', device: '<script>alert(1)</script>',
+    }, 'E')
+    await evil.ready
+    await untilDevices(port, session, (x) => x.live === 1)
+    // /__dshn/devices without an accept:json serves the picker page directly.
+    const page = await request(port, '/__dshn/devices', { cookie: session })
+    expect(page.headers['content-type']).toContain('text/html')
+    expect(page.body).not.toContain('<script>alert(1)</script>')
+    expect(page.body).toContain('&lt;script&gt;')
+    evil.ws.close()
   })
 })
