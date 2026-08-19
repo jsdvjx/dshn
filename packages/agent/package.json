@@ -1,0 +1,57 @@
+{
+  "name": "dshn-agent",
+  "version": "0.1.0",
+  "description": "Forward this machine's local DeepSeek Harness (dsh) web service to the public internet over ds.hn: an outbound WSS tunnel to the relay, plus the trust-fence integration that lets forwarded requests through.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "tunnel",
+    "forwarding",
+    "ds.hn"
+  ],
+  "license": "MIT",
+  "author": "jsdvjx",
+  "homepage": "https://github.com/jsdvjx/dshn#readme",
+  "bugs": "https://github.com/jsdvjx/dshn/issues",
+  "repository": { "type": "git", "url": "git+https://github.com/jsdvjx/dshn.git", "directory": "packages/agent" },
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  },
+  "dependencies": {
+    "@dshn/protocol": "file:../protocol",
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*"
+  },
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "3.18.1"
+  }
+}

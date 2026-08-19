@@ -1,0 +1,25 @@
+# Bundle layer contributed by dshn-agent.
+#
+# Just the host-half row. There is deliberately NO `connection.trustedHosts`
+# override any more: the agent replays every forwarded request to local dsh with
+# Host/Origin rewritten to loopback, so dsh's /api trust fence accepts it as a
+# local, same-origin request for ANY public subdomain. That is what lets the
+# subdomain be chosen at runtime in the setup dialog instead of baked into the
+# composition — and access is gated by the relay's login, not the fence.
+#
+# No credentials live here either: the user sets subdomain + password in the UI
+# (POST /dshn/configure), and they persist to DSHN_STATE. Only infrastructure is
+# configured here, all with sensible defaults, so `dsh plugin add` then a normal
+# local launch is enough — the dialog does the rest.
+- insert:
+    - id: dshn-agent
+      name: 'dshn-agent'
+      inject: [webServer, settings]
+      config:
+        enabled: !!js (process.env.DSHN_ENABLED ?? '1') !== '0'
+        # Zero-config default goes through Cloudflare. For sustained heavy
+        # throughput, point DSHN_RELAY_HOST at a grey-cloud origin
+        # (wss://origin.ds.hn:8787) with DSHN_ORIGIN_CA to connect direct.
+        relayHost: !!js process.env.DSHN_RELAY_HOST ?? 'relay.ds.hn'
+        originCa: !!js process.env.DSHN_ORIGIN_CA ?? ''
+        statePath: !!js process.env.DSHN_STATE ?? ''
