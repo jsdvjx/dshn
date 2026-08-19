@@ -106,6 +106,16 @@ export interface HelloFrame {
   agent: string
   /** {@link DSHN_PROTOCOL_VERSION} the agent speaks. */
   protocol: number
+  /**
+   * Stable per-install device id (multi-device). Several agents may hold the
+   * SAME subdomain concurrently as long as their device ids differ; a repeat
+   * of an id supersedes that device's previous connection. Absent on legacy
+   * agents, which the relay treats as one shared id — preserving the old
+   * one-agent-per-subdomain behavior for them.
+   */
+  deviceId?: string
+  /** Human-readable device name for the relay's device switcher (e.g. the hostname). */
+  device?: string
 }
 
 /** Relay → agent: the token was accepted; the tunnel is live. */

@@ -153,7 +153,7 @@ window.__ModuleLoader__.load({
           if (!info || !info.enabled || !info.salt) { window.fetch = realFetch; window.WebSocket = RealWS; window.__dshnE2E.stage = 'off-restored'; resolveReady(); return }
           active = true
           window.__dshnE2E.stage = 'gating'
-          await unlockGate(info.salt)
+          await unlockGate(info.salt, info.device)
           window.__dshnE2E.stage = 'unlocked'
         } catch (e) { window.fetch = realFetch; window.WebSocket = RealWS; window.__dshnE2E.stage = 'error'; window.__dshnE2E.error = String(e && e.message || e) }
         resolveReady()
@@ -161,7 +161,7 @@ window.__ModuleLoader__.load({
 
       // A blocking DOM overlay (not React — must appear before the app mounts)
       // asking for the e2e password; verified by a sealed probe to /api.
-      function unlockGate(salt) {
+      function unlockGate(salt, deviceKey) {
         return new Promise((resolve) => {
           const zh = String(document.documentElement.lang || navigator.language || 'en').toLowerCase().indexOf('zh') === 0
           const L = zh
@@ -169,12 +169,24 @@ window.__ModuleLoader__.load({
                 save: '在此设备记住密码', stale: '已保存的密码无法解锁（可能已被更改），请重新输入。' }
             : { t: 'End-to-end encrypted', s: 'This session is end-to-end encrypted. Enter the e2e password to unlock — it is never sent to the cloud.', p: 'E2E password', u: 'Unlock', bad: 'Wrong password — cannot decrypt.',
                 save: 'Remember on this device', stale: 'The saved password no longer works (it may have been changed). Enter it again.' }
-          // Remembered password lives in localStorage, per public host, on THIS
-          // device only — never transmitted (E2E is intact). Keyed by host (not
-          // salt) so a changed e2e password is detected and re-prompted.
-          const STORE_KEY = 'dshn:e2e:' + location.hostname
-          const readSaved = () => { try { return localStorage.getItem(STORE_KEY) } catch { return null } }
-          const writeSaved = (v) => { try { if (v == null) localStorage.removeItem(STORE_KEY); else localStorage.setItem(STORE_KEY, v) } catch { /* storage may be blocked */ } }
+          // Remembered password lives in localStorage, per public host AND per
+          // device, on THIS browser only — never transmitted (E2E is intact).
+          // The device part matters on a multi-device subdomain: each machine
+          // has its own e2e password, and one saved copy must not clobber (or be
+          // probed against) another device's. Keyed by host+device (not salt) so
+          // a changed e2e password is detected and re-prompted. The old
+          // host-only key is read once as a fallback and migrated on success.
+          const LEGACY_KEY = 'dshn:e2e:' + location.hostname
+          const STORE_KEY = LEGACY_KEY + (deviceKey ? ':' + deviceKey : '')
+          const readSaved = () => {
+            try { return localStorage.getItem(STORE_KEY) || (STORE_KEY !== LEGACY_KEY ? localStorage.getItem(LEGACY_KEY) : null) } catch { return null }
+          }
+          const writeSaved = (v) => {
+            try {
+              if (v == null) localStorage.removeItem(STORE_KEY); else localStorage.setItem(STORE_KEY, v)
+              if (STORE_KEY !== LEGACY_KEY) localStorage.removeItem(LEGACY_KEY)
+            } catch { /* storage may be blocked */ }
+          }
 
           // Derive from a password string and probe /api with a sealed body; on a
           // correct key set the live key and return true. A wrong key → agent 400
@@ -198,7 +210,10 @@ window.__ModuleLoader__.load({
             let stale = false
             const saved = readSaved()
             if (saved) {
-              if (await attempt(saved)) { window.__dshnE2E.autounlock = true; resolve(); return }
+              if (await attempt(saved)) {
+                writeSaved(saved) // re-write so a legacy host-only entry migrates to the per-device key
+                window.__dshnE2E.autounlock = true; resolve(); return
+              }
               writeSaved(null); stale = true // the saved one no longer works → drop it and tell the user
             }
 
@@ -364,6 +379,22 @@ window.__ModuleLoader__.load({
 .dshn-dcwarn-body { font-size: 11.5px; color: var(--dsw-alias-label-secondary, #4a4f57); }
 .dshn-danger { flex: 1; padding: 7px; border: 0; border-radius: 8px; cursor: pointer;
   background: var(--dsw-alias-state-error-primary, #e5484d); color: #fff; font-size: 13px; }
+
+/* Multi-device switcher (remote pages only): a footer row like the local one,
+   opening a small fixed popover above it listing this subdomain's devices. */
+.dshn-devpop { position: fixed; left: 12px; bottom: 56px; z-index: 70; width: 244px;
+  box-sizing: border-box; padding: 10px 10px 8px; border-radius: 12px;
+  background: var(--dsw-alias-bg-layer-3, #fff);
+  border: 1px solid var(--dsw-alias-border-l1, rgba(128,134,142,.25));
+  box-shadow: var(--dsw-shadow-lv3, 0 12px 32px rgba(0,0,0,.24)); }
+.dshn-devpop-title { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8b9099); margin: 0 4px 6px; }
+.dshn-devrow { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box;
+  padding: 8px 9px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; text-align: left;
+  color: var(--dsw-alias-label-primary, #1c1e21); font-size: 13px; font-family: inherit; }
+.dshn-devrow:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover, rgba(128,134,142,.12)); }
+.dshn-devrow:disabled { cursor: default; opacity: .6; }
+.dshn-devrow-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dshn-devrow-tag { font-size: 10.5px; color: var(--dsw-alias-label-tertiary, #8b9099); }
 `
     const cssId = ID + '/widget.css'
     if (typeof document !== 'undefined'
@@ -386,7 +417,7 @@ window.__ModuleLoader__.load({
           savedHint: '手机访问用这个密码登录。忘记时点“复制/显示”取回。',
           weak: '弱', fair: '一般', good: '较强', strong: '强',
           infoRelay: '线路', infoMode: { direct: '直连源站', cloudflare: '经 Cloudflare' },
-          infoUptime: '在线时长', infoServed: '已转发请求', infoPort: '本地端口', infoLatency: '延迟',
+          infoUptime: '在线时长', infoServed: '已转发请求', infoPort: '本地端口', infoLatency: '延迟', infoDevice: '设备名',
           e2eLabel: '端到端密码（可选）', e2eHint: '设置后，会话内容用它加密，云端也看不到；密码不出本机。访问时需在网页再输一次。',
           e2eApply: '设置端到端密码', e2eUpdate: '更新端到端密码', e2eDisable: '关闭加密', e2eApplied: '✓ 端到端加密已开启', e2eOff2: '✓ 端到端加密已关闭', e2eIndep: '独立设置，不影响上面的连接。',
           infoE2E: '端到端加密', e2eOn: '已开启', e2eOff: '未开启',
@@ -398,7 +429,8 @@ window.__ModuleLoader__.load({
           mode: '模式', modeOfficial: '官方 ds.hn', modeSelf: '自托管', yourDomain: '你的域名', relayHost: '中继地址',
           relayHostHint: '填你自己的 @dshn/relay,如 wss://tunnel.example.com。子域会挂在它的域名下。',
           relayCa: '中继证书(自签名,可选)',
-          relayCaHint: '仅当你的中继用自签名证书时:粘贴其 PEM 证书以固定信任(公有证书/套 Cloudflare 时留空)。' }
+          relayCaHint: '仅当你的中继用自签名证书时:粘贴其 PEM 证书以固定信任(公有证书/套 Cloudflare 时留空)。',
+          devLabel: '设备', devSwitch: '切换设备', devOffline: '离线', devCurrent: '当前' }
       : { brand: 'Public forwarding · ds.hn', connecting: 'connecting…', live: 'live', off: 'off', notset: 'not set up',
           setupTitle: 'Set up public forwarding', setupSub: 'Pick a subdomain prefix and an access password — the two are your credential.',
           connTitle: 'Public forwarding', prefix: 'Subdomain prefix', password: 'Access password', confirm: 'Confirm password',
@@ -410,7 +442,7 @@ window.__ModuleLoader__.load({
           savedHint: 'Log in from a phone with this password. Copy/show it here if you forget.',
           weak: 'weak', fair: 'fair', good: 'good', strong: 'strong',
           infoRelay: 'Link', infoMode: { direct: 'direct to origin', cloudflare: 'via Cloudflare' },
-          infoUptime: 'Uptime', infoServed: 'Requests served', infoPort: 'Local port', infoLatency: 'Latency',
+          infoUptime: 'Uptime', infoServed: 'Requests served', infoPort: 'Local port', infoLatency: 'Latency', infoDevice: 'Device name',
           e2eLabel: 'End-to-end password (optional)', e2eHint: 'If set, session content is encrypted with it — even the cloud cannot read it, and it never leaves this machine. Visitors enter it again in the browser.',
           e2eApply: 'Set e2e password', e2eUpdate: 'Update e2e password', e2eDisable: 'Turn off', e2eApplied: '✓ End-to-end encryption on', e2eOff2: '✓ End-to-end encryption off', e2eIndep: 'Applied on its own — does not affect the connection above.',
           infoE2E: 'End-to-end encryption', e2eOn: 'on', e2eOff: 'off',
@@ -422,7 +454,8 @@ window.__ModuleLoader__.load({
           mode: 'Mode', modeOfficial: 'Official ds.hn', modeSelf: 'Self-hosted', yourDomain: 'your-domain', relayHost: 'Relay host',
           relayHostHint: 'Your own @dshn/relay, e.g. wss://tunnel.example.com. Your subdomain lives under its domain.',
           relayCa: 'Relay CA (self-signed, optional)',
-          relayCaHint: 'Only when your relay uses a self-signed cert: paste its PEM to pin trust (leave blank for a public cert / behind Cloudflare).' }
+          relayCaHint: 'Only when your relay uses a self-signed cert: paste its PEM to pin trust (leave blank for a public cert / behind Cloudflare).',
+          devLabel: 'Device', devSwitch: 'Switch device', devOffline: 'offline', devCurrent: 'current' }
 
     function strength(pw) {
       if (pw.length < MIN_PW) return { score: 0, ok: false }
@@ -623,6 +656,11 @@ window.__ModuleLoader__.load({
           s.localPort ? h('div', { className: 'dshn-info-row' },
             h('span', { className: 'dshn-info-k' }, Icon('server'), T.infoPort),
             h('span', { className: 'dshn-info-v' }, String(s.localPort))) : null,
+          // How this machine shows up in the multi-device switcher when several
+          // devices bind one subdomain.
+          s.deviceName ? h('div', { className: 'dshn-info-row' },
+            h('span', { className: 'dshn-info-k' }, Icon('server'), T.infoDevice),
+            h('span', { className: 'dshn-info-v' }, s.deviceName)) : null,
           h('div', { className: 'dshn-info-row' },
             h('span', { className: 'dshn-info-k' }, Icon(s.e2eEnabled ? 'lock' : 'unlock'), T.infoE2E),
             h('span', { className: 'dshn-info-v', style: { color: s.e2eEnabled ? '#3aa675' : undefined } }, s.e2eEnabled ? T.e2eOn : T.e2eOff))) : null,
@@ -779,6 +817,69 @@ window.__ModuleLoader__.load({
       return store
     }
 
+    // ── multi-device switcher (remote pages only) ─────────────────────────────
+    // On a public host, `/__dshn/devices` is answered by the RELAY (same host,
+    // behind the same login cookie): the list of devices bound to this subdomain.
+    // `multi` goes true when ≥2 are live — only then does the switcher appear.
+    // `/dshn-e2e` (answered by the SERVING device through the tunnel) tells us
+    // which device this page is actually on, for when no selection cookie is set.
+    // An old relay answers neither with JSON — the switcher just stays hidden.
+    const DEV_POLL_MS = 10000
+    const devStore = {
+      info: null, self: null, started: false, subs: new Set(),
+      set(patch) { Object.assign(this, patch); this.subs.forEach((f) => f()) },
+      sub(f) { this.subs.add(f); return () => this.subs.delete(f) },
+      start() {
+        if (this.started || pageLoopback) return
+        this.started = true
+        const tick = () => fetch('/__dshn/devices', { cache: 'no-store', credentials: 'include', headers: { accept: 'application/json' } })
+          .then((r) => (r.ok && String(r.headers.get('content-type') || '').includes('json') ? r.json() : null))
+          .then((j) => { if (j && Array.isArray(j.devices)) this.set({ info: j }) })
+          .catch(() => {})
+        tick(); setInterval(tick, DEV_POLL_MS)
+        fetch(E2E_PUB_PATH, { cache: 'no-store', credentials: 'include' })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((j) => { if (j && j.device) this.set({ self: j.device }) })
+          .catch(() => {})
+      },
+    }
+    function DeviceSwitcher() {
+      const [, force] = react.useReducer((x) => x + 1, 0)
+      react.useEffect(() => devStore.sub(force), [])
+      const [open, setOpen] = react.useState(false)
+      const [busy, setBusy] = react.useState(false)
+      const info = devStore.info
+      if (!info || !info.multi) return null
+      const devices = info.devices || []
+      const currentId = info.current || devStore.self
+      const current = devices.find((d) => d.id === currentId) || null
+      const pick = (d) => {
+        if (busy || !d.online || d.id === currentId) return
+        setBusy(true)
+        // Set the selection cookie, then a full reload boots the app cleanly
+        // against the chosen device (no cross-device state survives).
+        fetch('/__dshn/select', { method: 'POST', credentials: 'include',
+          headers: { 'content-type': 'application/json', accept: 'application/json' },
+          body: JSON.stringify({ device: d.id }) })
+          .then((r) => { if (r.ok) location.reload(); else setBusy(false) })
+          .catch(() => setBusy(false))
+      }
+      return h(react.Fragment, null,
+        h('button', { className: 'dshn-frow', title: T.devSwitch, 'aria-label': T.devSwitch, onClick: () => setOpen(!open) },
+          h('span', { className: 'dshn-frow-ic' }, Icon('server', { width: 16, height: 16 })),
+          h('span', { className: 'dshn-frow-label' }, current ? current.name : T.devLabel),
+          h('span', { className: 'dshn-frow-trail' }, (info.live || 0) + '/' + devices.length)),
+        open ? h('div', { className: 'dshn-devpop' },
+          h('div', { className: 'dshn-devpop-title' }, T.devSwitch),
+          devices.map((d) => h('button', {
+            key: d.id, className: 'dshn-devrow', disabled: busy || !d.online || d.id === currentId,
+            onClick: () => pick(d) },
+            h('span', { className: 'dshn-dot', 'data-on': d.online ? '1' : '0' }),
+            h('span', { className: 'dshn-devrow-name' }, d.name),
+            d.id === currentId ? h('span', { className: 'dshn-devrow-tag' }, T.devCurrent)
+              : (!d.online ? h('span', { className: 'dshn-devrow-tag' }, T.devOffline) : null)))) : null)
+    }
+
     // Open dsh's Settings and land on our section. The settings trigger is a
     // stable `button[aria-haspopup="dialog"]` (class names are hashed); once it
     // is open, click our section's nav entry by its label.
@@ -841,7 +942,10 @@ window.__ModuleLoader__.load({
     // Configuration itself lives in the Settings page, not here.
     function FooterButton() {
       useStore()
-      if (!pageLoopback) return null
+      // Remote pages get the device switcher in this slot instead of the local
+      // status row (configuration is local-only; switching devices is the one
+      // thing a remote visitor can do here).
+      if (!pageLoopback) return h(DeviceSwitcher)
       const s = store.status
       const connected = s && s.connected
       const configured = s && s.configured
@@ -871,7 +975,8 @@ window.__ModuleLoader__.load({
 
     const inject = ['slots']
     function apply(ctx) {
-      store.start()
+      if (pageLoopback) store.start()
+      else devStore.start()
       ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({ name: 'sidebar.footer.action', id: 'dshn-footer', order: 50 }, FooterButton))
       ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'dshn', order: 40, label: () => T.navLabel }, DshnSection))
       // Keep our settings-nav globe applied however the panel is opened (dsh's own

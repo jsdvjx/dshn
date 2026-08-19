@@ -16,8 +16,9 @@
  * registers on the dsh web server (all loopback-gated for configuration).
  */
 import http from 'node:http'
+import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { WebSocket, type RawData } from 'ws'
@@ -315,6 +316,19 @@ export class AgentTunnel {
   /** Public salt for the current e2e key. */
   private e2eSalt = ''
 
+  /**
+   * Stable device identity for multi-device: several machines may bind the same
+   * subdomain, and the relay tells them apart by this id. Derived, not stored:
+   * hashing the hostname with the state path gives an id that survives restarts
+   * and disconnects, distinguishes two profiles on one machine (different
+   * DSH_HOME/DSHN_STATE), and needs no schema or migration. Two agents sharing
+   * one profile dir collide — deliberately, since sharing a profile already
+   * means fighting over the same credentials.
+   */
+  readonly deviceId: string
+  /** Human-readable device name shown in the relay's switcher (env override, else hostname). */
+  readonly deviceName: string
+
   readonly status: TunnelStatus
   private creds: Credentials | null = null
   /** ms epoch the current tunnel became live (READY), or null when down. */
@@ -327,6 +341,8 @@ export class AgentTunnel {
   private pingSentAt = 0
 
   constructor(private readonly config: AgentConfig, private readonly localPort: () => number, private readonly store: CredsStore) {
+    this.deviceId = createHash('sha256').update(`${hostname()}|${config.statePath}`).digest('hex').slice(0, 12)
+    this.deviceName = (process.env.DSHN_DEVICE_NAME ?? hostname()).trim().slice(0, 40) || this.deviceId
     this.creds = this.store.load()
     this.refreshE2E()
     this.status = {
@@ -539,6 +555,8 @@ export class AgentTunnel {
           password: this.creds.password,
           agent: `dshn-agent/${DSHN_PROTOCOL_VERSION}`,
           protocol: DSHN_PROTOCOL_VERSION,
+          deviceId: this.deviceId,
+          device: this.deviceName,
         })
       }
       this.lastPong = Date.now()
@@ -994,6 +1012,9 @@ export function apply(ctx: any, rawConfig: Partial<AgentConfig> | undefined): vo
         lastError: tunnel.status.lastError,
         configurable: loopback,
         apex: publicApex(info.relayHost),
+        // This machine's identity in the multi-device switcher.
+        deviceId: tunnel.deviceId,
+        deviceName: tunnel.deviceName,
         // The saved password is the only recoverable copy (cloud stores a hash).
         // Only ever handed to a loopback caller — the local machine's owner.
         password: loopback ? tunnel.revealPassword() : null,
@@ -1023,7 +1044,10 @@ export function apply(ctx: any, rawConfig: Partial<AgentConfig> | undefined): vo
     path: E2E_PUB_PATH,
     handler: (_req: http.IncomingMessage, res: http.ServerResponse) => {
       const e = tunnel.e2eInfo()
-      json(res, 200, { enabled: e.enabled, salt: e.enabled ? e.salt : null })
+      // `device` lets the browser key its remembered e2e password per DEVICE,
+      // not just per host — on a multi-device subdomain each machine has its own
+      // e2e password, and one saved copy must not clobber another's.
+      json(res, 200, { enabled: e.enabled, salt: e.enabled ? e.salt : null, device: tunnel.deviceId })
     },
   })
 

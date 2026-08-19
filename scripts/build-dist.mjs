@@ -34,7 +34,7 @@ copyFileSync('README.md', 'dist/dshn/README.md')
 copyFileSync('LICENSE', 'dist/dshn/LICENSE')
 writeFileSync('dist/dshn/package.json', JSON.stringify({
   name: '@dshn/agent',
-  version: '0.1.7',
+  version: '0.2.0',
   description: 'Forward a local dsh web service to the public internet over ds.hn (bundled).',
   keywords: ['dsh', 'dsh-plugin', 'deepseek-harness', 'tunnel', 'forwarding', 'ds.hn'],
   license: 'MIT',
@@ -73,7 +73,7 @@ copyFileSync('SELF-HOSTING.md', 'dist/relay/README.md')
 copyFileSync('LICENSE', 'dist/relay/LICENSE')
 writeFileSync('dist/relay/package.json', JSON.stringify({
   name: '@dshn/relay',
-  version: '0.1.2',
+  version: '0.2.0',
   description: 'Self-hostable ds.hn-style relay: a login-gated *.<apex> tunnel router that bridges public requests to dshn agents.',
   keywords: ['dsh', 'deepseek-harness', 'tunnel', 'relay', 'self-hosted', 'reverse-tunnel', 'ds.hn'],
   license: 'MIT',

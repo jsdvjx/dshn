@@ -22,6 +22,11 @@ the relay operator sees only ciphertext.
 - **Trust-on-first-use claim.** The first agent to present a free subdomain sets
   its password (scrypt-hashed on the relay). Later connects and every browser
   login must match it — squatting-protected.
+- **Multi-device.** Several machines can bind ONE subdomain with the same
+  credential — each shows up as a named device. With ≥2 online, opening the URL
+  offers a device picker, and a switcher appears in the page's sidebar footer;
+  the choice sticks per browser (a routing cookie), and switching is a clean
+  reload against the other machine. One device online behaves exactly as before.
 - **Optional end-to-end encryption** (off by default). A *separate* e2e password,
   never sent to the relay, encrypts `/api` bodies and the event stream:
   PBKDF2-SHA256 (210k) → AES-256-GCM. Visitors enter it once in the browser; it

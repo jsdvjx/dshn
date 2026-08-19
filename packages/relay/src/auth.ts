@@ -52,6 +52,26 @@ export function cookieHeader(value: string): string {
 }
 
 /**
+ * Device-selection cookie (multi-device). Holds the device id the browser chose
+ * on the picker page; the relay routes every request on this host to that
+ * device. Not a credential — just a routing preference — so it needs no MAC.
+ */
+export const DEVICE_COOKIE = 'dshn_dev'
+
+/** Device-selection cookie lifetime: long, so a chosen device sticks. */
+const DEVICE_MAX_AGE_S = 180 * 24 * 3600
+
+/**
+ * The `Set-Cookie` header value selecting a device (or clearing the selection).
+ * @param deviceId - the chosen device id, or null to clear.
+ * @returns the cookie header string.
+ */
+export function deviceCookieHeader(deviceId: string | null): string {
+  if (deviceId === null) return `${DEVICE_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`
+  return `${DEVICE_COOKIE}=${deviceId}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${DEVICE_MAX_AGE_S}`
+}
+
+/**
  * Parse a `Cookie` request header into a name→value map.
  * @param header - the raw `Cookie` header, if any.
  * @returns the parsed cookies.
@@ -119,6 +139,70 @@ export function loginPage(host: string, error: boolean): string {
   <input type="password" name="password" placeholder="Access password" autofocus autocomplete="current-password" required>
   <button type="submit">Unlock</button>
 </form></body></html>`
+}
+
+/** One row of the device picker page. */
+export interface PickerDevice {
+  id: string
+  name: string
+  online: boolean
+  current: boolean
+}
+
+/**
+ * The device picker page, shown when several devices are bound to this
+ * subdomain and the browser has not chosen one (or its chosen one is gone).
+ * Each online device is a submit button POSTing the selection to
+ * `/__dshn/select`; the relay answers with the device cookie and a redirect.
+ * Self-contained HTML, same look as {@link loginPage}.
+ * @param host - the public host (e.g. `alice.ds.hn`).
+ * @param devices - the devices to list, already sorted.
+ * @returns the HTML document.
+ */
+export function devicesPage(host: string, devices: PickerDevice[]): string {
+  const rows = devices.map((d) => {
+    const dot = `<span class="dot${d.online ? ' on' : ''}"></span>`
+    const state = d.online ? '' : '<span class="off">offline</span>'
+    const mark = d.current ? '<span class="cur">current</span>' : ''
+    if (!d.online) {
+      return `<div class="dev dim">${dot}<span class="name">${escapeHtml(d.name)}</span>${mark}${state}</div>`
+    }
+    return `<form method="POST" action="/__dshn/select"><input type="hidden" name="device" value="${escapeHtml(d.id)}">`
+      + `<button class="dev" type="submit">${dot}<span class="name">${escapeHtml(d.name)}</span>${mark}<span class="go">→</span></button></form>`
+  }).join('\n')
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(host)} · devices · ds.hn</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center;
+    font: 15px/1.5 system-ui, sans-serif; background:#0f1115; color:#e8eaed; }
+  @media (prefers-color-scheme: light) { body { background:#f4f5f7; color:#1c1e21; } }
+  .card { width:min(360px,90vw); padding:26px 24px; border-radius:14px;
+    background:rgba(128,134,142,.12); }
+  h1 { font-size:15px; margin:0 0 4px; font-weight:600; }
+  .host { font-family:ui-monospace,Menlo,monospace; opacity:.7; font-size:13px; margin-bottom:6px; }
+  .hint { font-size:13px; opacity:.7; margin:0 0 16px; }
+  form { margin:0; }
+  .dev { display:flex; align-items:center; gap:10px; width:100%; box-sizing:border-box;
+    padding:11px 12px; margin-top:8px; border-radius:10px; text-align:left; font-size:14px;
+    border:1px solid rgba(128,134,142,.35); background:transparent; color:inherit; cursor:pointer; }
+  button.dev:hover { border-color:#4176e6; }
+  .dev.dim { cursor:default; opacity:.55; }
+  .dot { width:8px; height:8px; border-radius:50%; flex:none; background:rgba(128,134,142,.6); }
+  .dot.on { background:#3aa675; box-shadow:0 0 0 3px rgba(58,166,117,.2); }
+  .name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .cur { font-size:11px; color:#4176e6; border:1px solid currentColor; border-radius:99px; padding:1px 7px; }
+  .off { font-size:11px; opacity:.7; }
+  .go { opacity:.5; }
+</style></head>
+<body><div class="card">
+  <h1>ds.hn</h1>
+  <div class="host">${escapeHtml(host)}</div>
+  <p class="hint">Several devices share this address. Pick the one to use — you can switch any time from the sidebar.</p>
+  ${rows}
+</div></body></html>`
 }
 
 /** Minimal HTML escaping for the one interpolated value (the host). */

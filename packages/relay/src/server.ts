@@ -38,7 +38,10 @@ import {
   type HeaderList,
 } from '@dshn/protocol'
 import { ClaimStore } from './claims.js'
-import { COOKIE_NAME, cookieHeader, loginPage, parseCookies, sign, verify } from './auth.js'
+import {
+  COOKIE_NAME, DEVICE_COOKIE, cookieHeader, deviceCookieHeader, devicesPage, loginPage,
+  parseCookies, sign, verify, type PickerDevice,
+} from './auth.js'
 
 /** Relay construction options, all operator-supplied via the entry point. */
 export interface RelayOptions {
@@ -112,10 +115,11 @@ function flatHeaders(headers: HeaderList): string[] {
 class AgentConnection {
   private nextId = 1
   lastPong = Date.now()
+  readonly connectedAt = Date.now()
   readonly responses = new Map<number, http.ServerResponse>()
   readonly sockets = new Map<number, WebSocket>()
 
-  constructor(readonly subdomain: string, readonly ws: WebSocket) {}
+  constructor(readonly subdomain: string, readonly deviceId: string, readonly deviceName: string, readonly ws: WebSocket) {}
 
   /** Allocate the next stream id (wraps within uint32; collisions need ~4B live streams). */
   allocId(): number {
@@ -133,11 +137,56 @@ class AgentConnection {
   }
 }
 
+/**
+ * Device id assigned to a legacy agent whose HELLO carries none. All legacy
+ * agents of a subdomain share it, so a second one still supersedes the first —
+ * exactly the old one-agent-per-subdomain behavior.
+ */
+const LEGACY_DEVICE_ID = 'device'
+
+/** Sanitize an agent-supplied device id: short, flat, cookie/HTML-safe charset. */
+function sanitizeDeviceId(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  const id = raw.trim().toLowerCase()
+  return /^[a-z0-9][a-z0-9_-]{0,63}$/.test(id) ? id : null
+}
+
+/** Sanitize an agent-supplied device name: printable, bounded; empty → null. */
+function sanitizeDeviceName(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  // eslint-disable-next-line no-control-regex
+  const name = raw.replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, 40)
+  return name === '' ? null : name
+}
+
+/**
+ * Whether a request is a top-level HTML navigation — the only case where the
+ * device picker page may replace the response. API/asset fetches never see the
+ * picker: they either route to a live device or fail cleanly.
+ */
+function isNavigation(req: http.IncomingMessage): boolean {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false
+  const dest = String(req.headers['sec-fetch-dest'] ?? '')
+  if (dest !== '') return dest === 'document'
+  return String(req.headers.accept ?? '').includes('text/html')
+}
+
+/**
+ * Where a public request should go when its subdomain has 0..N live devices.
+ * `conn` routes to that device; `picker` shows the device page (navigations
+ * only); `offline` fails the request with the given message.
+ */
+type DeviceRoute =
+  | { kind: 'conn'; conn: AgentConnection }
+  | { kind: 'picker' }
+  | { kind: 'offline'; message: string }
+
 /** The relay server. Construct with options, then {@link listen}. */
 export class RelayServer {
   private readonly http: http.Server
   private readonly wss: WebSocketServer
-  private readonly agents = new Map<string, AgentConnection>()
+  /** Live agents: subdomain → device id → connection (multi-device). */
+  private readonly agents = new Map<string, Map<string, AgentConnection>>()
   /** Per-subdomain login failure tracking for the brute-force lockout. */
   private readonly loginGate = new Map<string, { count: number; last: number; until: number }>()
   private heartbeat: ReturnType<typeof setInterval> | null = null
@@ -160,14 +209,31 @@ export class RelayServer {
     this.heartbeat = setInterval(() => this.sweep(), HEARTBEAT_INTERVAL_MS)
   }
 
+  /** The actually bound port (differs from the option when it was 0). */
+  port(): number {
+    const addr = this.http.address()
+    return addr !== null && typeof addr === 'object' ? addr.port : this.opts.port
+  }
+
+  /** Shut down: drop every agent socket and stop listening (tests, embedding). */
+  close(): void {
+    if (this.heartbeat !== null) { clearInterval(this.heartbeat); this.heartbeat = null }
+    for (const group of this.agents.values()) for (const conn of group.values()) conn.ws.terminate()
+    this.wss.close()
+    this.http.close()
+    this.http.closeAllConnections()
+  }
+
   /** Drop agents that have gone silent past the timeout, and ping the rest. */
   private sweep(): void {
     const now = Date.now()
-    for (const conn of this.agents.values()) {
-      if (now - conn.lastPong > HEARTBEAT_TIMEOUT_MS) {
-        if (process.env.DSHN_DEBUG) console.error(`[relay] heartbeat timeout for "${conn.subdomain}" (silent ${now - conn.lastPong}ms) — terminating`)
-        conn.ws.terminate()
-      } else conn.send({ t: 'ping' })
+    for (const group of this.agents.values()) {
+      for (const conn of group.values()) {
+        if (now - conn.lastPong > HEARTBEAT_TIMEOUT_MS) {
+          if (process.env.DSHN_DEBUG) console.error(`[relay] heartbeat timeout for "${conn.subdomain}"/${conn.deviceId} (silent ${now - conn.lastPong}ms) — terminating`)
+          conn.ws.terminate()
+        } else conn.send({ t: 'ping' })
+      }
     }
     // Drop stale login-gate entries (lock expired and no recent failures) so the
     // map can't grow without bound from probing traffic.
@@ -199,8 +265,16 @@ export class RelayServer {
       return this.serveLogin(res, `${sub}.${this.opts.apex}`, false, 200)
     }
 
-    const conn = this.agents.get(sub)
-    if (conn === undefined) return this.fail(res, 502, 'Tunnel offline — the device is not connected.')
+    // Multi-device endpoints, behind the login gate: the device list (JSON for
+    // the in-page switcher, HTML for a human) and the selection setter.
+    const bareUrl = url.split('?', 1)[0]
+    if (bareUrl === '/__dshn/devices') return this.serveDevices(req, res, sub, cookies)
+    if (bareUrl === '/__dshn/select' && req.method === 'POST') return this.handleSelect(req, res, sub)
+
+    const route = this.resolveDevice(sub, cookies, isNavigation(req))
+    if (route.kind === 'picker') return this.servePicker(res, sub, cookies)
+    if (route.kind === 'offline') return this.fail(res, 502, route.message)
+    const conn = route.conn
 
     const id = conn.allocId()
     conn.responses.set(id, res)
@@ -272,6 +346,115 @@ export class RelayServer {
     this.loginGate.set(key, { count: fails, last: now, until })
   }
 
+  // ── multi-device routing ──────────────────────────────────────────────────
+
+  /**
+   * Pick the device a public request should reach. One live device (and no
+   * contrary selection) routes straight to it — the classic single-device path,
+   * bit-for-bit the old behavior. With several devices, the `dshn_dev` cookie
+   * decides; without one, a navigation gets the picker page while API/asset
+   * requests keep flowing to the longest-connected device (the one that was
+   * already serving before the second joined), so an open session never breaks
+   * the moment another machine binds the same subdomain. A selection pointing
+   * at a dead device fails closed rather than silently landing on a DIFFERENT
+   * machine.
+   */
+  private resolveDevice(sub: string, cookies: Record<string, string>, nav: boolean): DeviceRoute {
+    const group = this.agents.get(sub)
+    const live = group?.size ?? 0
+    const offline: DeviceRoute = { kind: 'offline', message: 'Tunnel offline — the device is not connected.' }
+    const chosen = cookies[DEVICE_COOKIE] ?? ''
+    if (chosen !== '') {
+      const conn = group?.get(chosen)
+      if (conn !== undefined) return { kind: 'conn', conn }
+      if (live === 0) return offline
+      return nav ? { kind: 'picker' } : { kind: 'offline', message: 'Selected device is offline — reload this page to pick another.' }
+    }
+    if (live === 0) return offline
+    if (live === 1) return { kind: 'conn', conn: group!.values().next().value as AgentConnection }
+    if (nav) return { kind: 'picker' }
+    let oldest: AgentConnection | undefined
+    for (const conn of group!.values()) {
+      if (oldest === undefined || conn.connectedAt < oldest.connectedAt) oldest = conn
+    }
+    return { kind: 'conn', conn: oldest! }
+  }
+
+  /** Live + remembered devices of a subdomain, for the picker/JSON list. */
+  private deviceList(sub: string, cookies: Record<string, string>): Array<PickerDevice & { lastSeen: number }> {
+    const group = this.agents.get(sub)
+    const chosen = cookies[DEVICE_COOKIE] ?? ''
+    const out = new Map<string, PickerDevice & { lastSeen: number }>()
+    for (const rec of this.opts.claims.devicesOf(sub)) {
+      out.set(rec.id, { id: rec.id, name: rec.name, online: false, current: rec.id === chosen, lastSeen: rec.lastSeen })
+    }
+    for (const [id, conn] of group ?? []) {
+      out.set(id, { id, name: conn.deviceName, online: true, current: id === chosen, lastSeen: conn.connectedAt })
+    }
+    return [...out.values()].sort((a, b) => Number(b.online) - Number(a.online) || b.lastSeen - a.lastSeen)
+  }
+
+  /** Serve the HTML device picker page. */
+  private servePicker(res: http.ServerResponse, sub: string, cookies: Record<string, string>): void {
+    const html = devicesPage(`${sub}.${this.opts.apex}`, this.deviceList(sub, cookies))
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(html)
+  }
+
+  /**
+   * `GET /__dshn/devices`: the device list. JSON for the in-page switcher
+   * (`accept: application/json`), the picker page for a human. `multi` is what
+   * tells the switcher to appear at all — true only with ≥2 live devices.
+   */
+  private serveDevices(req: http.IncomingMessage, res: http.ServerResponse, sub: string, cookies: Record<string, string>): void {
+    if (!String(req.headers.accept ?? '').includes('application/json')) return this.servePicker(res, sub, cookies)
+    const devices = this.deviceList(sub, cookies)
+    const live = this.agents.get(sub)?.size ?? 0
+    const current = devices.find((d) => d.current)?.id ?? null
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end(JSON.stringify({ multi: live >= 2, live, current, devices }))
+  }
+
+  /**
+   * `POST /__dshn/select`: set the device-selection cookie. Accepts the picker
+   * page's form (`device=<id>`, answered with a redirect home) and the in-page
+   * switcher's JSON (`{"device":"<id>"}`, answered with JSON). Only a currently
+   * known device may be selected.
+   */
+  private handleSelect(req: http.IncomingMessage, res: http.ServerResponse, sub: string): void {
+    let body = ''
+    let over = false
+    req.on('data', (chunk: Buffer) => {
+      body += chunk.toString('utf8')
+      if (body.length > MAX_LOGIN_BODY) { over = true; req.destroy() }
+    })
+    req.on('end', () => {
+      if (over) return
+      const asJson = String(req.headers['content-type'] ?? '').includes('application/json')
+      let raw: unknown
+      if (asJson) {
+        try { raw = (JSON.parse(body) as { device?: unknown }).device } catch { raw = undefined }
+      } else {
+        raw = new URLSearchParams(body).get('device') ?? undefined
+      }
+      const id = sanitizeDeviceId(raw)
+      const known = id !== null && (this.agents.get(sub)?.has(id) === true
+        || this.opts.claims.devicesOf(sub).some((d) => d.id === id))
+      if (id === null || !known) {
+        res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+        res.end(JSON.stringify({ error: 'unknown device' }))
+        return
+      }
+      if (asJson) {
+        res.writeHead(200, { 'set-cookie': deviceCookieHeader(id), 'content-type': 'application/json', 'cache-control': 'no-store' })
+        res.end(JSON.stringify({ ok: true, device: id }))
+      } else {
+        res.writeHead(302, { 'set-cookie': deviceCookieHeader(id), location: '/' })
+        res.end()
+      }
+    })
+  }
+
   /** Cached apex site files, keyed by filename, invalidated by mtime. */
   private readonly site = new Map<string, { mtimeMs: number; body: Buffer }>()
 
@@ -329,13 +512,15 @@ export class RelayServer {
       socket.destroy()
       return
     }
-    const conn = this.agents.get(sub)
-    if (conn === undefined) {
+    // A WebSocket upgrade is never a navigation: it routes by the device cookie
+    // (or the single/oldest live device) exactly like an API request.
+    const route = this.resolveDevice(sub, cookies, false)
+    if (route.kind !== 'conn') {
       socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n')
       socket.destroy()
       return
     }
-    this.wss.handleUpgrade(req, socket, head, (browser) => this.bridgeSocket(conn, browser, req))
+    this.wss.handleUpgrade(req, socket, head, (browser) => this.bridgeSocket(route.conn, browser, req))
   }
 
   private registerAgent(ws: WebSocket): void {
@@ -356,18 +541,32 @@ export class RelayServer {
         return
       }
       const sub = frame.subdomain
-      const previous = this.agents.get(sub)
+      // Multi-device: several agents may hold one subdomain, keyed by device id.
+      // Only the SAME device id supersedes (a reconnect); a legacy agent without
+      // an id gets the shared LEGACY_DEVICE_ID, preserving the old
+      // one-agent-per-subdomain behavior among legacy agents.
+      const deviceId = sanitizeDeviceId(frame.deviceId) ?? LEGACY_DEVICE_ID
+      const deviceName = sanitizeDeviceName(frame.device) ?? deviceId
+      const group = this.agents.get(sub) ?? new Map<string, AgentConnection>()
+      this.agents.set(sub, group)
+      const previous = group.get(deviceId)
       if (previous !== undefined) {
-        if (process.env.DSHN_DEBUG) console.error(`[relay] new agent for "${sub}" — terminating previous (in-flight res=${previous.responses.size} ws=${previous.sockets.size})`)
-        previous.ws.terminate() // one live agent per subdomain
+        if (process.env.DSHN_DEBUG) console.error(`[relay] new agent for "${sub}"/${deviceId} — terminating previous (in-flight res=${previous.responses.size} ws=${previous.sockets.size})`)
+        previous.ws.terminate() // one live agent per (subdomain, device)
       }
 
-      const conn = new AgentConnection(sub, ws)
-      this.agents.set(sub, conn)
+      const conn = new AgentConnection(sub, deviceId, deviceName, ws)
+      group.set(deviceId, conn)
+      this.opts.claims.touchDevice(sub, deviceId, deviceName, Date.now())
       ws.on('message', (d: RawData, bin: boolean) => this.onAgentFrame(conn, d, bin))
       ws.on('close', (code: number, reason: Buffer) => {
-        if (process.env.DSHN_DEBUG) console.error(`[relay] agent ws "${sub}" close code=${code} reason=${reason.toString('utf8')} bufferedAmount=${ws.bufferedAmount}`)
-        if (this.agents.get(sub) === conn) this.agents.delete(sub)
+        if (process.env.DSHN_DEBUG) console.error(`[relay] agent ws "${sub}"/${deviceId} close code=${code} reason=${reason.toString('utf8')} bufferedAmount=${ws.bufferedAmount}`)
+        const g = this.agents.get(sub)
+        if (g?.get(deviceId) === conn) {
+          g.delete(deviceId)
+          if (g.size === 0) this.agents.delete(sub)
+          this.opts.claims.touchDevice(sub, deviceId, deviceName, Date.now())
+        }
         this.cleanup(conn)
       })
       ws.on('error', (err: Error) => {

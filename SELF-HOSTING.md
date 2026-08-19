@@ -141,7 +141,11 @@ fails closed rather than coming up unauthenticated. Back up `claims.json`: it's
 the only record of who owns which subdomain (losing it frees every name to
 re-claim). It's written atomically and `chmod 600`.
 
-## One agent per subdomain
+## Devices per subdomain
 
-Exactly one live agent may hold a subdomain at a time; a second agent with the
-same credential replaces the first. Run one agent per `(subdomain, password)`.
+Several agents (devices) may hold one subdomain at a time with the same
+credential; the relay tells them apart by a per-install device id and offers a
+device picker/switcher in the browser when two or more are online. Only a
+reconnect of the SAME device replaces its previous connection. Legacy agents
+that predate device ids all share one slot, so among them the old rule still
+applies: a second one replaces the first.

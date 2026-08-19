@@ -21,7 +21,24 @@ interface ClaimRecord {
   salt: string
   /** First-claim timestamp (ms), passed in by the caller (the store never clocks). */
   createdAt: number
+  /**
+   * Devices that have held this claim, by device id — so the device picker can
+   * list a machine that is currently offline. Bounded (oldest dropped) so a
+   * claim's record cannot grow without limit.
+   */
+  devices?: Record<string, DeviceRecord>
 }
+
+/** One device's last-known identity under a claim. */
+export interface DeviceRecord {
+  /** Human-readable name the agent reported (e.g. its hostname). */
+  name: string
+  /** Last connect/disconnect timestamp (ms), caller-supplied. */
+  lastSeen: number
+}
+
+/** Most devices remembered per claim; the least recently seen are dropped. */
+const MAX_DEVICES_PER_CLAIM = 20
 
 /** Result of a claim-or-verify attempt. */
 export interface ClaimResult {
@@ -67,12 +84,22 @@ export class ClaimStore {
     }
   }
 
-  /** Persist atomically: write a temp file, then rename over the target. */
+  /**
+   * Persist atomically: write a temp file, then rename over the target. An IO
+   * failure (disk full, permissions) must not throw into the caller — persist
+   * runs inside WebSocket event handlers, where an uncaught throw would take
+   * the relay down. The in-memory map stays authoritative and the next
+   * successful persist writes everything.
+   */
   private persist(): void {
-    const body = JSON.stringify({ claims: Object.fromEntries(this.claims) })
-    const tmp = `${this.path}.tmp`
-    writeFileSync(tmp, body, { mode: 0o600 })
-    renameSync(tmp, this.path)
+    try {
+      const body = JSON.stringify({ claims: Object.fromEntries(this.claims) })
+      const tmp = `${this.path}.tmp`
+      writeFileSync(tmp, body, { mode: 0o600 })
+      renameSync(tmp, this.path)
+    } catch (err) {
+      console.error(`dshn-relay: cannot persist claims to ${this.path}: ${(err as Error).message}`)
+    }
   }
 
   /**
@@ -114,5 +141,33 @@ export class ClaimStore {
   /** Whether a subdomain has been claimed (an agent may be offline). */
   isClaimed(subdomain: string): boolean {
     return this.claims.has(subdomain)
+  }
+
+  /**
+   * Record that a device connected (or disconnected) under a claim, updating its
+   * name and last-seen time. Called on agent register and close — rare events,
+   * so the synchronous persist is fine here.
+   * @param subdomain - the claimed label the device holds.
+   * @param deviceId - the device's stable id.
+   * @param name - the device's display name as reported in HELLO.
+   * @param now - current time in ms.
+   */
+  touchDevice(subdomain: string, deviceId: string, name: string, now: number): void {
+    const claim = this.claims.get(subdomain)
+    if (claim === undefined) return
+    const devices = claim.devices ?? (claim.devices = {})
+    devices[deviceId] = { name, lastSeen: now }
+    const ids = Object.keys(devices)
+    if (ids.length > MAX_DEVICES_PER_CLAIM) {
+      ids.sort((a, b) => devices[a].lastSeen - devices[b].lastSeen)
+      for (const id of ids.slice(0, ids.length - MAX_DEVICES_PER_CLAIM)) delete devices[id]
+    }
+    this.persist()
+  }
+
+  /** Known devices of a claim (connected or not), for the device picker. */
+  devicesOf(subdomain: string): Array<{ id: string } & DeviceRecord> {
+    const devices = this.claims.get(subdomain)?.devices ?? {}
+    return Object.entries(devices).map(([id, d]) => ({ id, name: d.name, lastSeen: d.lastSeen }))
   }
 }
