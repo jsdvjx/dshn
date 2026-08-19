@@ -34,7 +34,7 @@ copyFileSync('README.md', 'dist/dshn-agent/README.md')
 copyFileSync('LICENSE', 'dist/dshn-agent/LICENSE')
 writeFileSync('dist/dshn-agent/package.json', JSON.stringify({
   name: 'dshn-agent',
-  version: '0.1.0',
+  version: '0.1.1',
   description: 'Forward a local dsh web service to the public internet over ds.hn (bundled).',
   keywords: ['dsh', 'dsh-plugin', 'deepseek-harness', 'tunnel', 'forwarding', 'ds.hn'],
   license: 'MIT',
@@ -50,9 +50,9 @@ writeFileSync('dist/dshn-agent/package.json', JSON.stringify({
     bundle: { patch: 'cordis.patch.yml' },
     client: { platform: 'web', inject: ['@deepseek-ai/dsh-client-runtime', '@deepseek-ai/dsh-client-ui-layout'] },
   },
-  // schemastery is bundled (inlined) because dsh can't resolve an external one
-  // from the plugin's dist dir; declared here too for a from-npm/git install.
-  dependencies: { '@deepseek-ai/schemastery': '*' },
+  // No runtime dependencies: schemastery, ws, and @dshn/protocol are all inlined
+  // by esbuild, so `npm i dshn-agent` (or `dsh plugin add dshn-agent`) pulls a
+  // single self-contained package. cordis is provided by the dsh host at runtime.
   peerDependencies: { '@deepseek-ai/cordis': '*' },
 }, null, 2) + '\n')
 

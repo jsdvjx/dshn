@@ -73,13 +73,19 @@ an account-backed control plane replaces it later.
 
 ## Install the agent (user's machine)
 
-Prebuilt tarball from the latest release (recommended — no build step):
+From npm (recommended — one command, fully self-contained):
+
+```sh
+dsh plugin --profile web add dshn-agent
+dsh --profile web
+```
+
+Or a prebuilt tarball from the latest GitHub release:
 
 ```sh
 curl -L -o dshn-agent.tgz \
   https://github.com/jsdvjx/dshn/releases/latest/download/dshn-agent.tgz
 dsh plugin --profile web add ./dshn-agent.tgz
-dsh --profile web
 ```
 
 Or build from source:
