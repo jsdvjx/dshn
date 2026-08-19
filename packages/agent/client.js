@@ -331,12 +331,12 @@ window.__ModuleLoader__.load({
 .dshn-err { color: var(--dsw-alias-state-error-primary, #e5484d); font-size: 11.5px; margin-bottom: 9px; }
 .dshn-hint { color: var(--dsw-alias-label-tertiary, #8b9099); font-size: 10.5px; margin-top: 3px; }
 .dshn-note { color: var(--dsw-alias-state-warn-primary, #d98324); font-size: 10.5px; margin: 2px 0 10px; }
-.dshn-adv { margin: 2px 0 12px; }
-.dshn-adv-toggle { border: 0; background: transparent; cursor: pointer; padding: 4px 0; font-size: 11.5px;
-  color: var(--dsw-alias-label-tertiary, #8b9099); font-family: inherit; }
-.dshn-adv-toggle:hover { color: var(--dsw-alias-label-primary, #1c1e21); }
-.dshn-adv-body { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; padding: 11px 12px; border-radius: 10px;
-  border: 1px solid var(--dsw-alias-border-l2, rgba(128,134,142,.25)); background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
+.dshn-modeseg { display: flex; gap: 4px; padding: 3px; border-radius: 9px; background: var(--dsw-alias-bg-layer-2, #f4f5f7);
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,134,142,.22)); }
+.dshn-modebtn { flex: 1; padding: 6px 10px; border: 0; border-radius: 6px; cursor: pointer; font-size: 12.5px; font-family: inherit;
+  background: transparent; color: var(--dsw-alias-label-secondary, #4a4f57); }
+.dshn-modebtn.dshn-on { background: var(--dsw-alias-bg-layer-1, #fff); color: var(--dsw-alias-label-primary, #1c1e21);
+  box-shadow: 0 1px 2px rgba(0,0,0,.08); }
 .dshn-ca { min-height: 54px; resize: vertical; font-family: ui-monospace, Menlo, monospace; font-size: 11px; line-height: 1.4; }
 .dshn-e2e-box { margin: 4px 0 12px; padding: 11px 12px; border-radius: 10px;
   border: 1px solid var(--dsw-alias-border-l2, rgba(128,134,142,.25)); background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
@@ -392,8 +392,8 @@ window.__ModuleLoader__.load({
           openSettings: '打开设置', open: '打开', addrLabel: '公网地址',
           dcTitle: '确认断开公网转发？', dcWarn: '断开会立即切断公网访问。云端不保存你的密码、无法找回；若你没有另存密码，之后可能无法用同一前缀重新连接。',
           dcConfirm: '确认断开', dcCancel: '取消', dcCopyFirst: '先复制密码',
-          advanced: '高级 · 自托管中继', relayHost: '中继地址',
-          relayHostHint: '自托管时填你自己的中继,如 wss://tunnel.example.com;留空即用默认。改动后点“连接/重新连接”生效。',
+          mode: '模式', modeOfficial: '官方 ds.hn', modeSelf: '自托管', yourDomain: '你的域名', relayHost: '中继地址',
+          relayHostHint: '填你自己的 @dshn/relay,如 wss://tunnel.example.com。子域会挂在它的域名下。',
           relayCa: '中继证书(自签名,可选)',
           relayCaHint: '仅当你的中继用自签名证书时:粘贴其 PEM 证书以固定信任(公有证书/套 Cloudflare 时留空)。' }
       : { brand: 'Public forwarding · ds.hn', connecting: 'connecting…', live: 'live', off: 'off', notset: 'not set up',
@@ -416,8 +416,8 @@ window.__ModuleLoader__.load({
           openSettings: 'open settings', open: 'open', addrLabel: 'Public address',
           dcTitle: 'Disconnect public forwarding?', dcWarn: 'This immediately cuts off public access. The cloud does not store your password and cannot recover it — if you have not saved it elsewhere, you may not be able to reconnect with the same prefix.',
           dcConfirm: 'Disconnect', dcCancel: 'Cancel', dcCopyFirst: 'Copy password first',
-          advanced: 'Advanced · self-hosted relay', relayHost: 'Relay host',
-          relayHostHint: 'For self-hosting, your own relay, e.g. wss://tunnel.example.com; blank uses the default. Connect / Reconnect to apply.',
+          mode: 'Mode', modeOfficial: 'Official ds.hn', modeSelf: 'Self-hosted', yourDomain: 'your-domain', relayHost: 'Relay host',
+          relayHostHint: 'Your own @dshn/relay, e.g. wss://tunnel.example.com. Your subdomain lives under its domain.',
           relayCa: 'Relay CA (self-signed, optional)',
           relayCaHint: 'Only when your relay uses a self-signed cert: paste its PEM to pin trust (leave blank for a public cert / behind Cloudflare).' }
 
@@ -494,11 +494,12 @@ window.__ModuleLoader__.load({
       const [e2eBusy, setE2eBusy] = react.useState(false)
       const [e2eErr, setE2eErr] = react.useState('')
       const [e2eMsg, setE2eMsg] = react.useState('')
-      // Self-hosted relay overrides (advanced). Pre-filled from the saved settings.
+      // Mode: 'official' (ds.hn) vs 'selfhost' (your own @dshn/relay). Both share
+      // the subdomain + password + e2e; self-hosted just adds the relay location.
       const rs0 = s.relaySettings || {}
+      const [mode, setMode] = react.useState(rs0.relayHost ? 'selfhost' : 'official')
       const [relayHost, setRelayHost] = react.useState(rs0.relayHost || '')
       const [originCa, setOriginCa] = react.useState(rs0.originCa || '')
-      const [showAdvanced, setShowAdvanced] = react.useState(!!rs0.relayHost)
 
       // When the saved passwords arrive from a later status poll, fill them once.
       react.useEffect(() => {
@@ -512,21 +513,21 @@ window.__ModuleLoader__.load({
       react.useEffect(() => {
         const rs = s.relaySettings
         if (!rs) return
-        if (rs.relayHost && relayHost === '') { setRelayHost(rs.relayHost); setShowAdvanced(true) }
+        if (rs.relayHost && relayHost === '') { setRelayHost(rs.relayHost); setMode('selfhost') }
         if (rs.originCa && originCa === '') setOriginCa(rs.originCa)
       }, [s.relaySettings && s.relaySettings.relayHost])
 
       // The domain suffix reflects the self-hosted relay AS YOU TYPE it (a
       // client-side mirror of the server's apex derivation), so the preview shows
-      // YOUR domain — not the default ds.hn — before you've connected. Empty →
-      // the server's current apex.
+      // YOUR domain before connecting. Official mode → the server's apex (ds.hn).
       const apex = (() => {
+        if (mode !== 'selfhost') return s.apex || 'ds.hn'
         const rh = relayHost.trim()
-        if (rh === '') return s.apex || 'ds.hn'
+        if (rh === '') return T.yourDomain
         const bare = rh.replace(/^wss?:\/\//, '').replace(/:\d+$/, '').replace(/\/.*$/, '')
         const parts = bare.split('.')
         if (parts.length > 2 && (parts[0] === 'relay' || parts[0] === 'origin')) return parts.slice(1).join('.')
-        return bare || (s.apex || 'ds.hn')
+        return bare || T.yourDomain
       })()
 
       const copyText = (text, tag) => {
@@ -551,7 +552,8 @@ window.__ModuleLoader__.load({
       // whole thing is one flow. Once configured, e2e moves to its own dedicated
       // control below (its own apply button, independent of the connection).
       const e2eRegOk = configured || e2e.trim() === '' || e2e.trim().length >= MIN_PW
-      const canSubmit = prefix.trim().length > 0 && !busy && e2eRegOk
+      const selfhostOk = mode !== 'selfhost' || relayHost.trim() !== ''
+      const canSubmit = prefix.trim().length > 0 && !busy && e2eRegOk && selfhostOk
         && (configured ? pw.length >= MIN_PW : (st.ok && confirm.length > 0 && matches))
 
       const submit = () => {
@@ -559,7 +561,8 @@ window.__ModuleLoader__.load({
         setBusy(true); setErr('')
         const e2eVal = e2e.trim()
         fetch('/dshn/configure', { method: 'POST', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ subdomain: prefix.trim().toLowerCase(), password: pw, relayHost: relayHost.trim(), originCa: originCa.trim() }) })
+          body: JSON.stringify({ subdomain: prefix.trim().toLowerCase(), password: pw,
+            relayHost: mode === 'selfhost' ? relayHost.trim() : '', originCa: mode === 'selfhost' ? originCa.trim() : '' }) })
           .then((r) => r.json().then((j) => ({ ok: r.ok, j })))
           .then(async ({ ok, j }) => {
             if (!ok) { setBusy(false); setErr((j && j.error) || 'failed'); return }
@@ -620,10 +623,29 @@ window.__ModuleLoader__.load({
 
         liveErr ? h('div', { className: 'dshn-err' }, liveErr) : null,
 
+        // Mode: official ds.hn vs self-hosted. The subdomain + password + e2e
+        // below are shared; self-hosted just adds where your own relay lives.
+        h('div', { className: 'dshn-field' },
+          h('span', null, T.mode),
+          h('div', { className: 'dshn-modeseg' },
+            h('button', { type: 'button', className: 'dshn-modebtn' + (mode === 'official' ? ' dshn-on' : ''), onClick: () => setMode('official') }, T.modeOfficial),
+            h('button', { type: 'button', className: 'dshn-modebtn' + (mode === 'selfhost' ? ' dshn-on' : ''), onClick: () => setMode('selfhost') }, T.modeSelf))),
+
+        mode === 'selfhost' ? h('label', { className: 'dshn-field' },
+          h('span', null, T.relayHost),
+          h('input', { className: 'dshn-input', value: relayHost, placeholder: 'wss://tunnel.example.com',
+            autoComplete: 'off', spellCheck: false, autoFocus: !configured, onChange: (ev) => setRelayHost(ev.target.value) }),
+          h('div', { className: 'dshn-hint' }, T.relayHostHint)) : null,
+        mode === 'selfhost' ? h('label', { className: 'dshn-field' },
+          h('span', null, T.relayCa),
+          h('textarea', { className: 'dshn-input dshn-ca', value: originCa, rows: 3, spellCheck: false,
+            placeholder: '-----BEGIN CERTIFICATE-----', onChange: (ev) => setOriginCa(ev.target.value) }),
+          h('div', { className: 'dshn-hint' }, T.relayCaHint)) : null,
+
         h('label', { className: 'dshn-field' },
           h('span', null, T.prefix),
           h('div', { className: 'dshn-prefixwrap' },
-            h('input', { className: 'dshn-input', value: prefix, placeholder: 'alice', autoFocus: !configured,
+            h('input', { className: 'dshn-input', value: prefix, placeholder: 'alice', autoFocus: !configured && mode !== 'selfhost',
               onChange: (e) => setPrefix(e.target.value.toLowerCase()) }),
             h('span', { className: 'dshn-apex' }, '.' + apex)),
           !configured ? h('div', { className: 'dshn-hint' }, T.prefixHint) : null),
@@ -696,24 +718,6 @@ window.__ModuleLoader__.load({
               s.e2eEnabled ? h('button', { className: 'dshn-btn-sm dshn-btn-warn', disabled: e2eBusy, onClick: () => { setE2e(''); applyE2E('') } }, T.e2eDisable) : null),
             h('div', { className: 'dshn-hint', style: { marginTop: '7px' } }, T.e2eHint + ' ' + T.e2eIndep))
         })() : null,
-
-        // Advanced — self-hosted relay. Point the agent at your own @dshn/relay
-        // instead of the default ds.hn. Collapsed unless a custom relay is already
-        // set; applied on Connect/Reconnect (changing it reconnects the tunnel).
-        h('div', { className: 'dshn-adv' },
-          h('button', { type: 'button', className: 'dshn-adv-toggle', onClick: () => setShowAdvanced(!showAdvanced) },
-            (showAdvanced ? '▾ ' : '▸ ') + T.advanced),
-          showAdvanced ? h('div', { className: 'dshn-adv-body' },
-            h('label', { className: 'dshn-field' },
-              h('span', null, T.relayHost),
-              h('input', { className: 'dshn-input', value: relayHost, placeholder: s.defaultRelayHost || 'relay.ds.hn',
-                autoComplete: 'off', spellCheck: false, onChange: (ev) => setRelayHost(ev.target.value) }),
-              h('div', { className: 'dshn-hint' }, T.relayHostHint)),
-            h('label', { className: 'dshn-field' },
-              h('span', null, T.relayCa),
-              h('textarea', { className: 'dshn-input dshn-ca', value: originCa, rows: 3, spellCheck: false,
-                placeholder: '-----BEGIN CERTIFICATE-----', onChange: (ev) => setOriginCa(ev.target.value) }),
-              h('div', { className: 'dshn-hint' }, T.relayCaHint))) : null),
 
         // Disconnecting severs public access and the password is unrecoverable
         // from the cloud — so it takes an explicit, spelled-out confirmation.
