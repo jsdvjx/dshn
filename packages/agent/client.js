@@ -279,7 +279,7 @@ window.__ModuleLoader__.load({
   border: 1px solid var(--dsw-alias-border-l1, rgba(128,134,142,.25)); }
 .dshn-panel[data-mode="modal"] { width: min(400px, 92vw); padding: 20px 22px 18px; box-shadow: 0 24px 64px rgba(0,0,0,.34); }
 .dshn-panel[data-mode="card"] { width: 308px; margin-top: 8px; padding: 14px 15px 13px; box-shadow: 0 8px 24px rgba(0,0,0,.16); }
-.dshn-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+.dshn-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 9px; }
 .dshn-htitle { font-size: 14.5px; font-weight: 650; }
 .dshn-hsub { color: var(--dsw-alias-label-tertiary, #8b9099); font-size: 11.5px; margin-top: 2px; }
 .dshn-x { border: 0; background: transparent; cursor: pointer; font-size: 17px; line-height: 1; padding: 2px 4px;
@@ -289,7 +289,7 @@ window.__ModuleLoader__.load({
 .dshn-status { display: flex; align-items: center; gap: 7px; margin-bottom: 11px; font-size: 12px; }
 .dshn-url { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.dshn-addr { display: flex; align-items: center; gap: 6px; margin-bottom: 12px; padding: 8px 8px 8px 11px;
+.dshn-addr { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; padding: 6px 8px 6px 11px;
   border: 1px solid var(--dsw-alias-border-l2, rgba(128,134,142,.25)); border-radius: 10px;
   background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
 .dshn-addr-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--dsw-alias-label-tertiary, #8b9099); }
@@ -303,10 +303,10 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-tertiary, #8b9099); text-decoration: none; }
 .dshn-addr-btn:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(128,134,142,.16)); color: var(--dsw-alias-label-primary, #1c1e21); }
 
-.dshn-field { display: block; margin-bottom: 11px; }
-.dshn-field > span { display: block; color: var(--dsw-alias-label-tertiary, #8b9099); font-size: 11px; margin-bottom: 4px; }
+.dshn-field { display: block; margin-bottom: 7px; }
+.dshn-field > span { display: block; color: var(--dsw-alias-label-tertiary, #8b9099); font-size: 11px; margin-bottom: 3px; }
 .dshn-prefixwrap { display: flex; align-items: stretch; }
-.dshn-input { width: 100%; box-sizing: border-box; padding: 8px 10px; font-size: 13.5px;
+.dshn-input { width: 100%; box-sizing: border-box; padding: 6px 10px; font-size: 13.5px;
   border: 1px solid var(--dsw-alias-border-l1, rgba(128,134,142,.35)); border-radius: 8px; background: transparent; color: inherit; }
 .dshn-input:focus { outline: 2px solid var(--dsw-alias-label-primary-bluish, #4176e6); outline-offset: -1px; }
 .dshn-input[data-bad="1"] { border-color: var(--dsw-alias-state-error-primary, #e5484d); }
@@ -325,27 +325,27 @@ window.__ModuleLoader__.load({
 .dshn-strength { font-size: 10.5px; margin-top: 3px; }
 
 .dshn-actions { display: flex; gap: 8px; align-items: center; margin-top: 3px; }
-.dshn-primary { flex: 1; padding: 9px; border: 0; border-radius: 8px; cursor: pointer; background: #4176e6; color: #fff; font-size: 13.5px; }
+.dshn-primary { flex: 1; padding: 7px; border: 0; border-radius: 8px; cursor: pointer; background: #4176e6; color: #fff; font-size: 13.5px; }
 .dshn-primary:disabled { opacity: .5; cursor: default; }
-.dshn-ghost { border: 0; background: transparent; cursor: pointer; color: var(--dsw-alias-label-tertiary, #8b9099); font-size: 12.5px; padding: 9px 8px; }
+.dshn-ghost { border: 0; background: transparent; cursor: pointer; color: var(--dsw-alias-label-tertiary, #8b9099); font-size: 12.5px; padding: 7px 8px; }
 .dshn-err { color: var(--dsw-alias-state-error-primary, #e5484d); font-size: 11.5px; margin-bottom: 9px; }
 .dshn-hint { color: var(--dsw-alias-label-tertiary, #8b9099); font-size: 10.5px; margin-top: 3px; }
-.dshn-note { color: var(--dsw-alias-state-warn-primary, #d98324); font-size: 10.5px; margin: 2px 0 10px; }
-.dshn-modeseg { display: flex; gap: 4px; padding: 3px; border-radius: 9px; background: var(--dsw-alias-bg-layer-2, #f4f5f7);
+.dshn-note { color: var(--dsw-alias-state-warn-primary, #d98324); font-size: 10.5px; margin: 2px 0 8px; }
+.dshn-modeseg { display: flex; gap: 4px; padding: 2px; border-radius: 9px; background: var(--dsw-alias-bg-layer-2, #f4f5f7);
   border: 1px solid var(--dsw-alias-border-l2, rgba(128,134,142,.22)); }
-.dshn-modebtn { flex: 1; padding: 6px 10px; border: 0; border-radius: 6px; cursor: pointer; font-size: 12.5px; font-family: inherit;
+.dshn-modebtn { flex: 1; padding: 5px 10px; border: 0; border-radius: 6px; cursor: pointer; font-size: 12.5px; font-family: inherit;
   background: transparent; color: var(--dsw-alias-label-secondary, #4a4f57); }
 .dshn-modebtn.dshn-on { background: var(--dsw-alias-bg-layer-1, #fff); color: var(--dsw-alias-label-primary, #1c1e21);
   box-shadow: 0 1px 2px rgba(0,0,0,.08); }
-.dshn-ca { min-height: 54px; resize: vertical; font-family: ui-monospace, Menlo, monospace; font-size: 11px; line-height: 1.4; }
+.dshn-ca { min-height: 46px; resize: vertical; font-family: ui-monospace, Menlo, monospace; font-size: 11px; line-height: 1.4; }
 .dshn-catoggle { border: 0; background: transparent; cursor: pointer; padding: 2px 0; font-size: 11px; font-family: inherit;
   color: var(--dsw-alias-label-tertiary, #8b9099); }
 .dshn-catoggle:hover { color: var(--dsw-alias-label-primary, #1c1e21); }
-.dshn-e2e-box { margin: 4px 0 12px; padding: 11px 12px; border-radius: 10px;
+.dshn-e2e-box { margin: 2px 0 8px; padding: 9px 11px; border-radius: 10px;
   border: 1px solid var(--dsw-alias-border-l2, rgba(128,134,142,.25)); background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
-.dshn-e2e-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px;
+.dshn-e2e-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px;
   color: var(--dsw-alias-label-tertiary, #8b9099); font-size: 11px; }
-.dshn-e2e-actions { display: flex; gap: 8px; align-items: center; margin-top: 9px; }
+.dshn-e2e-actions { display: flex; gap: 8px; align-items: center; margin-top: 7px; }
 .dshn-btn-sm { padding: 6px 12px; border: 0; border-radius: 7px; cursor: pointer; font-size: 12px;
   background: #4176e6; color: #fff; }
 .dshn-btn-sm:disabled { opacity: .5; cursor: default; }
@@ -353,16 +353,16 @@ window.__ModuleLoader__.load({
   border: 1px solid var(--dsw-alias-border-l1, rgba(128,134,142,.3)); }
 .dshn-btn-warn:hover:not(:disabled) { background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #e5484d) 10%, transparent); }
 .dshn-info { border: 1px solid var(--dsw-alias-border-l2, rgba(128,134,142,.22)); border-radius: 9px;
-  padding: 8px 10px; margin-bottom: 12px; }
-.dshn-info-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 11.5px; padding: 3px 0; }
+  padding: 6px 10px; margin-bottom: 8px; }
+.dshn-info-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 11.5px; padding: 1.5px 0; }
 .dshn-info-k { display: inline-flex; align-items: center; gap: 7px; color: var(--dsw-alias-label-tertiary, #8b9099); }
 .dshn-info-k svg { flex: none; opacity: .85; }
 .dshn-info-v { font-family: ui-monospace, Menlo, monospace; text-align: right; font-variant-numeric: tabular-nums; }
 .dshn-dcwarn { border: 1px solid var(--dsw-alias-state-error-primary, #e5484d); background: rgba(229,72,77,.08);
-  border-radius: 9px; padding: 10px 11px; margin-bottom: 11px; }
-.dshn-dcwarn-title { font-weight: 640; font-size: 12.5px; margin-bottom: 5px; }
+  border-radius: 9px; padding: 8px 10px; margin-bottom: 8px; }
+.dshn-dcwarn-title { font-weight: 640; font-size: 12.5px; margin-bottom: 3px; }
 .dshn-dcwarn-body { font-size: 11.5px; color: var(--dsw-alias-label-secondary, #4a4f57); }
-.dshn-danger { flex: 1; padding: 9px; border: 0; border-radius: 8px; cursor: pointer;
+.dshn-danger { flex: 1; padding: 7px; border: 0; border-radius: 8px; cursor: pointer;
   background: var(--dsw-alias-state-error-primary, #e5484d); color: #fff; font-size: 13px; }
 `
     const cssId = ID + '/widget.css'
@@ -629,6 +629,11 @@ window.__ModuleLoader__.load({
 
         liveErr ? h('div', { className: 'dshn-err' }, liveErr) : null,
 
+        // While confirming a disconnect, hide the whole editable form (you're
+        // leaving it) so the confirmation stays short and fully visible instead of
+        // growing the panel past its container.
+        confirmDc ? null : h(react.Fragment, null,
+
         // Mode: official ds.hn vs self-hosted. The subdomain + password + e2e
         // below are shared; self-hosted just adds where your own relay lives.
         h('div', { className: 'dshn-field' },
@@ -725,7 +730,7 @@ window.__ModuleLoader__.load({
                 e2eBusy ? T.connecting2 : (s.e2eEnabled ? T.e2eUpdate : T.e2eApply)),
               s.e2eEnabled ? h('button', { className: 'dshn-btn-sm dshn-btn-warn', disabled: e2eBusy, onClick: () => { setE2e(''); applyE2E('') } }, T.e2eDisable) : null),
             h('div', { className: 'dshn-hint', style: { marginTop: '7px' } }, T.e2eHint + ' ' + T.e2eIndep))
-        })() : null,
+        })() : null),
 
         // Disconnecting severs public access and the password is unrecoverable
         // from the cloud — so it takes an explicit, spelled-out confirmation.
