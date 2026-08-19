@@ -119,13 +119,15 @@ Agent environment (all optional; sensible defaults):
 ## Self-host your own network
 
 You don't have to use `ds.hn` — run the whole thing on your own domain. The relay
-ships as **`@dshn/relay`** (npm) and a Docker image; your agents point at it with
+ships as **`@dshn/relay`** (npm) and a Docker image; point your agents at it in
+the setup form (pick **自托管 / Self-hosted** and paste the relay URL) or with
 `DSHN_RELAY_HOST`. Full guide, including DNS + TLS options: **[SELF-HOSTING.md](./SELF-HOSTING.md)**.
 
 ```sh
-# your server
-DSHN_APEX=tunnel.example.com DSHN_COOKIE_SECRET=$(openssl rand -hex 32) npx @dshn/relay
-# your dsh
+# your server — the only thing you set is your apex; the cookie secret is
+# auto-generated and persisted, claims + secret live in --data-dir
+npx @dshn/relay --apex tunnel.example.com --data-dir /var/lib/dshn
+# your dsh — or just set it in Settings → 公网转发 → 自托管
 DSHN_RELAY_HOST=wss://tunnel.example.com dsh --profile web
 ```
 

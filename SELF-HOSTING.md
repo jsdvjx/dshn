@@ -26,15 +26,16 @@ your relay.
 
 ### Option A — npm (Node ≥ 20)
 
+The only thing you have to pass is your apex. The cookie secret is
+**auto-generated and saved** on first run (no `openssl rand`), and the claims
+file + secret live together in `--data-dir`:
+
 ```sh
-DSHN_APEX=tunnel.example.com \
-DSHN_RELAY_PORT=8787 \
-DSHN_COOKIE_SECRET=$(openssl rand -hex 32) \
-DSHN_CLAIMS=/var/lib/dshn/claims.json \
-  npx @dshn/relay
+npx @dshn/relay --apex tunnel.example.com --data-dir /var/lib/dshn
 ```
 
-Install it as a long-running service (systemd):
+`--help` lists every flag. Each flag also has an env var (e.g. `DSHN_APEX`) if you
+prefer those. Install it as a long-running service (systemd):
 
 ```ini
 # /etc/systemd/system/dshn-relay.service
@@ -43,11 +44,7 @@ Description=dshn relay
 After=network.target
 
 [Service]
-Environment=DSHN_APEX=tunnel.example.com
-Environment=DSHN_RELAY_PORT=8787
-Environment=DSHN_COOKIE_SECRET=<hex-from-openssl-rand-hex-32>
-Environment=DSHN_CLAIMS=/var/lib/dshn/claims.json
-ExecStart=/usr/bin/npx --yes @dshn/relay
+ExecStart=/usr/bin/npx --yes @dshn/relay --apex tunnel.example.com --data-dir /var/lib/dshn
 Restart=always
 DynamicUser=yes
 StateDirectory=dshn
@@ -66,14 +63,13 @@ sudo systemctl enable --now dshn-relay
 docker run -d --name dshn-relay --restart unless-stopped \
   -p 8787:8787 \
   -e DSHN_APEX=tunnel.example.com \
-  -e DSHN_COOKIE_SECRET=$(openssl rand -hex 32) \
-  -e DSHN_CLAIMS=/data/claims.json \
   -v dshn-data:/data \
   ghcr.io/jsdvjx/dshn-relay:latest
 ```
 
-Or use the provided [`docker-compose.yml`](./docker-compose.yml) (`docker compose up -d`).
-The image is built from [`Dockerfile`](./Dockerfile) and just runs `@dshn/relay`.
+The image defaults `--data-dir` to `/data`, so the auto-generated secret and the
+claims file persist on the `dshn-data` volume — nothing else to set. Or use the
+provided [`docker-compose.yml`](./docker-compose.yml) (`DSHN_APEX=tunnel.example.com docker compose up -d`).
 
 ## 2. TLS — pick one
 
@@ -91,11 +87,9 @@ The relay speaks WebSocket, which needs `wss://` (TLS) end-to-end.
   then point the relay at it and serve 443 directly:
 
   ```sh
-  DSHN_APEX=tunnel.example.com DSHN_RELAY_PORT=443 \
-  DSHN_COOKIE_SECRET=… DSHN_CLAIMS=/var/lib/dshn/claims.json \
-  DSHN_TLS_CERT=/etc/letsencrypt/live/tunnel.example.com/fullchain.pem \
-  DSHN_TLS_KEY=/etc/letsencrypt/live/tunnel.example.com/privkey.pem \
-    npx @dshn/relay
+  npx @dshn/relay --apex tunnel.example.com --data-dir /var/lib/dshn --port 443 \
+    --tls-cert /etc/letsencrypt/live/tunnel.example.com/fullchain.pem \
+    --tls-key  /etc/letsencrypt/live/tunnel.example.com/privkey.pem
   ```
 
   (Binding 443 needs root or `CAP_NET_BIND_SERVICE`.) Agents connect with the
@@ -124,22 +118,26 @@ Then open dsh → **Settings → 公网转发 / Public forwarding**, pick a subd
 prefix + password, and connect. The first agent to claim a free subdomain sets
 its password (trust-on-first-use); it's scrypt-hashed on your relay.
 
-## Relay environment reference
+## Configuration reference
 
-| var | required | default | purpose |
+Every setting is a CLI flag (`--flag value`) or the matching env var; **flags win**.
+Run `npx @dshn/relay --help` for the live list.
+
+| flag | env | default | purpose |
 |---|---|---|---|
-| `DSHN_COOKIE_SECRET` | ✅ | — | HMAC secret for login-session cookies (rotating it logs everyone out) |
-| `DSHN_APEX` | — | `ds.hn` | the apex your wildcard hangs off |
-| `DSHN_RELAY_PORT` | — | `8787` | listen port |
-| `DSHN_CLAIMS` | — | `./claims.json` | JSON file the relay creates/maintains: subdomain → scrypt hash |
-| `DSHN_TLS_CERT` / `DSHN_TLS_KEY` | — | — | PEM paths to serve HTTPS directly (omit to serve plain HTTP behind a TLS-terminating proxy) |
-| `DSHN_SITE` | — | — | optional landing-page `index.html` for the bare apex (flat sibling `.html`/`.css`/… served too) |
-| `DSHN_DEBUG` | — | — | set to log connection lifecycle to stderr |
+| `--apex` | `DSHN_APEX` | `ds.hn` | the apex your wildcard hangs off |
+| `--data-dir` | `DSHN_DATA_DIR` | `./dshn-data` | holds `claims.json` + the auto-generated `cookie-secret` |
+| `--port` | `DSHN_RELAY_PORT` | `8787` | listen port |
+| `--secret` | `DSHN_COOKIE_SECRET` | *(auto-generated)* | cookie HMAC secret; set one only if you want to pin it |
+| `--claims` | `DSHN_CLAIMS` | `<data-dir>/claims.json` | JSON file the relay creates/maintains: subdomain → scrypt hash |
+| `--tls-cert` / `--tls-key` | `DSHN_TLS_CERT` / `DSHN_TLS_KEY` | — | PEM paths to serve HTTPS directly (omit to serve plain HTTP behind a TLS-terminating proxy) |
+| `--site` | `DSHN_SITE` | — | optional landing-page `index.html` for the bare apex (flat sibling `.html`/`.css`/… served too) |
+| — | `DSHN_DEBUG` | — | set to log connection lifecycle to stderr |
 
-The relay refuses to start without `DSHN_COOKIE_SECRET` — a misconfigured relay
-fails closed rather than coming up unauthenticated. Back up `claims.json`: it's
-the only record of who owns which subdomain (losing it frees every name to
-re-claim). It's written atomically and `chmod 600`.
+You don't have to set a cookie secret: on first run the relay generates a strong
+random one and saves it to `<data-dir>/cookie-secret` (`chmod 600`), reusing it on
+restart so sessions survive. **Back up your `--data-dir`** — `claims.json` is the
+only record of who owns which subdomain, and deleting the secret logs everyone out.
 
 ## Devices per subdomain
 

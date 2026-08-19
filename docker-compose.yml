@@ -1,8 +1,8 @@
-# Self-host the dshn relay with one command:  docker compose up -d
-# Set DSHN_COOKIE_SECRET (e.g. `openssl rand -hex 32`) and your apex first —
-# an .env file next to this compose file works:
-#   DSHN_APEX=tunnel.example.com
-#   DSHN_COOKIE_SECRET=<hex>
+# Self-host the dshn relay with one command:
+#   DSHN_APEX=tunnel.example.com docker compose up -d
+# The ONLY thing to set is your apex (an .env file next to this compose file with
+# `DSHN_APEX=tunnel.example.com` works too). The cookie secret is auto-generated
+# and, with claims.json, persists on the dshn-data volume.
 # See SELF-HOSTING.md for DNS/TLS and pointing agents at the relay.
 services:
   relay:
@@ -13,8 +13,7 @@ services:
       - "${DSHN_RELAY_PORT:-8787}:8787"
     environment:
       DSHN_APEX: "${DSHN_APEX:?set DSHN_APEX (e.g. tunnel.example.com)}"
-      DSHN_COOKIE_SECRET: "${DSHN_COOKIE_SECRET:?set DSHN_COOKIE_SECRET (openssl rand -hex 32)}"
-      DSHN_CLAIMS: /data/claims.json
+      DSHN_DATA_DIR: /data
       DSHN_DEBUG: "${DSHN_DEBUG:-}"
     volumes:
       - dshn-data:/data

@@ -6,10 +6,11 @@
 FROM node:20-slim
 ARG DSHN_RELAY_VERSION=latest
 RUN npm install -g @dshn/relay@${DSHN_RELAY_VERSION} && npm cache clean --force
-# claims.json (subdomain → scrypt hash) persists on a volume; back it up.
-ENV DSHN_CLAIMS=/data/claims.json
+# The data dir (claims.json + the auto-generated cookie-secret) persists on the
+# volume — back it up. Nothing else needs setting except your apex.
+ENV DSHN_DATA_DIR=/data
 ENV DSHN_RELAY_PORT=8787
 VOLUME /data
 EXPOSE 8787
-# DSHN_COOKIE_SECRET and DSHN_APEX must be supplied at run time (see SELF-HOSTING.md).
+# Only DSHN_APEX must be supplied at run time (or pass --apex). See SELF-HOSTING.md.
 ENTRYPOINT ["dshn-relay"]

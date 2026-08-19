@@ -1,37 +1,97 @@
 #!/usr/bin/env node
 /**
- * Relay entry point. Reads its configuration from the environment (12-factor,
- * so the same build runs under a process manager or a container) and starts the
- * bridge. Everything security-relevant — the cookie secret and the tunnel
- * registry — is required, not defaulted, so a misconfigured relay fails to
- * start rather than coming up wide open.
+ * Relay entry point. Configuration comes from CLI flags OR env vars (flags win),
+ * with sane defaults so self-hosting is one short command — the ONLY thing you
+ * really have to pass is your apex:
  *
- * Env:
- *   DSHN_APEX            tunnel apex (default ds.hn)
- *   DSHN_RELAY_PORT      plain HTTP port behind Cloudflare (default 8787)
- *   DSHN_COOKIE_SECRET   HMAC secret for session cookies (REQUIRED)
- *   DSHN_CLAIMS          path to the claims JSON file (default ./claims.json)
- *   DSHN_TLS_CERT        path to a TLS cert (PEM) to serve HTTPS directly
- *   DSHN_TLS_KEY         path to the matching TLS key (PEM)
- *   DSHN_SITE            path to the site index.html served on the bare apex
- *                        (optional; flat sibling .html/.css assets served too)
+ *   npx @dshn/relay --apex tunnel.example.com            # behind Cloudflare / a TLS proxy
+ *   npx @dshn/relay --apex tunnel.example.com --port 443 \
+ *                   --tls-cert fullchain.pem --tls-key privkey.pem   # standalone HTTPS
+ *
+ * The cookie secret is auto-generated and persisted on first run (no more
+ * `openssl rand`), and the claims file + secret live together in one --data-dir.
+ * The old env vars (DSHN_APEX, DSHN_COOKIE_SECRET, DSHN_CLAIMS, …) all still work.
  */
-import { readFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { ClaimStore } from './claims.js'
 import { RelayServer, type RelayOptions } from './server.js'
 
-const apex = process.env.DSHN_APEX ?? 'ds.hn'
-const port = Number(process.env.DSHN_RELAY_PORT ?? 8787)
-const cookieSecret = process.env.DSHN_COOKIE_SECRET ?? ''
-const claimsPath = process.env.DSHN_CLAIMS ?? './claims.json'
-const tlsCert = process.env.DSHN_TLS_CERT ?? ''
-const tlsKey = process.env.DSHN_TLS_KEY ?? ''
-const sitePath = process.env.DSHN_SITE || undefined
-
-if (cookieSecret === '') {
-  console.error('dshn-relay: DSHN_COOKIE_SECRET is required')
-  process.exit(1)
+/** Minimal arg parser: `--k v`, `--k=v`, bare `--flag`, and `-h`/`--help`. */
+function parseArgs(argv: string[]): Record<string, string | boolean> {
+  const out: Record<string, string | boolean> = {}
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (a === '-h' || a === '--help') { out.help = true; continue }
+    if (!a.startsWith('--')) continue
+    const eq = a.indexOf('=')
+    if (eq >= 0) { out[a.slice(2, eq)] = a.slice(eq + 1); continue }
+    const next = argv[i + 1]
+    if (next !== undefined && !next.startsWith('-')) { out[a.slice(2)] = next; i++ } else out[a.slice(2)] = true
+  }
+  return out
 }
+
+const HELP = `dshn-relay — self-hostable ds.hn-style tunnel relay
+
+Usage:
+  dshn-relay --apex <domain> [options]
+
+The only setting you really need is your apex (the wildcard domain). The cookie
+secret is auto-generated + persisted on first run; claims + secret live in one
+--data-dir. Flags override env vars.
+
+Options (env var in parens):
+  --apex <domain>     wildcard apex, e.g. tunnel.example.com  (DSHN_APEX, default ds.hn)
+  --port <n>          listen port                             (DSHN_RELAY_PORT, default 8787)
+  --data-dir <dir>    holds claims.json + cookie-secret       (DSHN_DATA_DIR, default ./dshn-data)
+  --claims <file>     claims JSON path                        (DSHN_CLAIMS, default <data-dir>/claims.json)
+  --secret <hex>      cookie HMAC secret (else auto-generated)(DSHN_COOKIE_SECRET)
+  --tls-cert <file>   PEM cert to serve HTTPS directly        (DSHN_TLS_CERT)
+  --tls-key <file>    PEM key to serve HTTPS directly         (DSHN_TLS_KEY)
+  --site <file>       index.html to serve on the bare apex    (DSHN_SITE)
+  -h, --help          show this help
+
+Examples:
+  dshn-relay --apex tunnel.example.com
+  dshn-relay --apex tunnel.example.com --port 443 --tls-cert fullchain.pem --tls-key privkey.pem
+`
+
+const args = parseArgs(process.argv.slice(2))
+if (args.help) { console.log(HELP); process.exit(0) }
+
+/** Flag value, else env value, else undefined. Flags always win. */
+const val = (flag: string, env: string): string | undefined => {
+  const v = args[flag]
+  return typeof v === 'string' ? v : process.env[env]
+}
+
+const dataDir = val('data-dir', 'DSHN_DATA_DIR') ?? './dshn-data'
+const apex = val('apex', 'DSHN_APEX') ?? 'ds.hn'
+const port = Number(val('port', 'DSHN_RELAY_PORT') ?? 8787)
+const claimsPath = val('claims', 'DSHN_CLAIMS') ?? join(dataDir, 'claims.json')
+const tlsCert = val('tls-cert', 'DSHN_TLS_CERT') ?? ''
+const tlsKey = val('tls-key', 'DSHN_TLS_KEY') ?? ''
+const sitePath = val('site', 'DSHN_SITE') || undefined
+
+/**
+ * Cookie secret: an explicit --secret / DSHN_COOKIE_SECRET wins; otherwise load a
+ * persisted one, or generate + persist a strong random one on first run. This
+ * removes the `openssl rand` step and the "must set a secret or it won't start"
+ * friction, while still never coming up with a weak/empty secret. A generated
+ * secret survives restarts (deleting it logs everyone out).
+ */
+function loadOrCreateSecret(path: string): string {
+  try { const s = readFileSync(path, 'utf8').trim(); if (s.length >= 32) return s } catch { /* first run */ }
+  const secret = randomBytes(32).toString('hex')
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, secret + '\n', { mode: 0o600 })
+  console.error(`dshn-relay: generated a cookie secret at ${path} (keep it — deleting it logs everyone out)`)
+  return secret
+}
+let cookieSecret = val('secret', 'DSHN_COOKIE_SECRET') ?? ''
+if (cookieSecret === '') cookieSecret = loadOrCreateSecret(join(dataDir, 'cookie-secret'))
 
 let tls: RelayOptions['tls']
 if (tlsCert !== '' && tlsKey !== '') {
@@ -43,7 +103,8 @@ if (tlsCert !== '' && tlsKey !== '') {
   }
 }
 
+mkdirSync(dirname(claimsPath), { recursive: true }) // ensure the claims dir exists before first write
 const claims = ClaimStore.fromFile(claimsPath)
 
 const server = new RelayServer({ apex, port, cookieSecret, claims, tls, sitePath })
-server.listen(() => console.log(`dshn-relay listening on :${port} (${tls ? 'https' : 'http'}) for *.${apex}`))
+server.listen(() => console.log(`dshn-relay listening on :${port} (${tls ? 'https' : 'http'}) for *.${apex}  [data-dir: ${dataDir}]`))
