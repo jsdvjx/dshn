@@ -338,6 +338,9 @@ window.__ModuleLoader__.load({
 .dshn-modebtn.dshn-on { background: var(--dsw-alias-bg-layer-1, #fff); color: var(--dsw-alias-label-primary, #1c1e21);
   box-shadow: 0 1px 2px rgba(0,0,0,.08); }
 .dshn-ca { min-height: 54px; resize: vertical; font-family: ui-monospace, Menlo, monospace; font-size: 11px; line-height: 1.4; }
+.dshn-catoggle { border: 0; background: transparent; cursor: pointer; padding: 2px 0; font-size: 11px; font-family: inherit;
+  color: var(--dsw-alias-label-tertiary, #8b9099); }
+.dshn-catoggle:hover { color: var(--dsw-alias-label-primary, #1c1e21); }
 .dshn-e2e-box { margin: 4px 0 12px; padding: 11px 12px; border-radius: 10px;
   border: 1px solid var(--dsw-alias-border-l2, rgba(128,134,142,.25)); background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
 .dshn-e2e-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px;
@@ -500,6 +503,9 @@ window.__ModuleLoader__.load({
       const [mode, setMode] = react.useState(rs0.relayHost ? 'selfhost' : 'official')
       const [relayHost, setRelayHost] = react.useState(rs0.relayHost || '')
       const [originCa, setOriginCa] = react.useState(rs0.originCa || '')
+      // The self-signed CA is rarely needed (valid cert / Cloudflare cover most);
+      // hidden behind a toggle, auto-shown only if one is already saved.
+      const [showCa, setShowCa] = react.useState(!!rs0.originCa)
 
       // When the saved passwords arrive from a later status poll, fill them once.
       react.useEffect(() => {
@@ -514,7 +520,7 @@ window.__ModuleLoader__.load({
         const rs = s.relaySettings
         if (!rs) return
         if (rs.relayHost && relayHost === '') { setRelayHost(rs.relayHost); setMode('selfhost') }
-        if (rs.originCa && originCa === '') setOriginCa(rs.originCa)
+        if (rs.originCa && originCa === '') { setOriginCa(rs.originCa); setShowCa(true) }
       }, [s.relaySettings && s.relaySettings.relayHost])
 
       // The domain suffix reflects the self-hosted relay AS YOU TYPE it (a
@@ -636,11 +642,13 @@ window.__ModuleLoader__.load({
           h('input', { className: 'dshn-input', value: relayHost, placeholder: 'wss://tunnel.example.com',
             autoComplete: 'off', spellCheck: false, autoFocus: !configured, onChange: (ev) => setRelayHost(ev.target.value) }),
           h('div', { className: 'dshn-hint' }, T.relayHostHint)) : null,
-        mode === 'selfhost' ? h('label', { className: 'dshn-field' },
-          h('span', null, T.relayCa),
-          h('textarea', { className: 'dshn-input dshn-ca', value: originCa, rows: 3, spellCheck: false,
-            placeholder: '-----BEGIN CERTIFICATE-----', onChange: (ev) => setOriginCa(ev.target.value) }),
-          h('div', { className: 'dshn-hint' }, T.relayCaHint)) : null,
+        // Self-signed CA — hidden behind a toggle; only the rare self-signed relay
+        // needs it (valid cert / behind Cloudflare needs nothing).
+        mode === 'selfhost' ? h('div', { className: 'dshn-field' },
+          h('button', { type: 'button', className: 'dshn-catoggle', onClick: () => setShowCa(!showCa) }, (showCa ? '▾ ' : '▸ ') + T.relayCa),
+          showCa ? h('textarea', { className: 'dshn-input dshn-ca', value: originCa, rows: 3, spellCheck: false, style: { marginTop: '6px' },
+            placeholder: '-----BEGIN CERTIFICATE-----', onChange: (ev) => setOriginCa(ev.target.value) }) : null,
+          showCa ? h('div', { className: 'dshn-hint' }, T.relayCaHint) : null) : null,
 
         h('label', { className: 'dshn-field' },
           h('span', null, T.prefix),
