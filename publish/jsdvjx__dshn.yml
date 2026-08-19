@@ -1,0 +1,11 @@
+# Ready-to-submit entry for https://github.com/awesome-dsh-plugin/awesome-dsh-plugin
+# Copy this file to `data/plugins/jsdvjx__dshn.yml` in that repo (see ../PUBLISHING.md).
+# Descriptions are quoted because they contain characters YAML would otherwise
+# interpret (`*`, `:`).
+url: https://github.com/jsdvjx/dshn
+name: jsdvjx/dshn
+category: remote
+description:
+  en: "Forwards a local dsh web UI to the public internet over a *.ds.hn subdomain through a login-gated WSS relay behind Cloudflare, with optional end-to-end encryption (PBKDF2 to AES-256-GCM)."
+  zh: "通过带登录网关的 WSS 中继(经 Cloudflare)把本地 dsh 网页转发到公网 *.ds.hn 子域名,支持可选的端到端加密(PBKDF2 到 AES-256-GCM)。"
+tarball: https://github.com/jsdvjx/dshn/releases/latest/download/dshn-agent.tgz
