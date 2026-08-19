@@ -1,0 +1,25 @@
+{
+  "name": "dshn",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DeepSeek Harness Network — public-internet forwarding for a local dsh web service, over ds.hn: a dsh plugin (local agent) + a WSS relay behind Cloudflare.",
+  "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "tunnel", "forwarding", "ds.hn"],
+  "license": "MIT",
+  "author": "jsdvjx",
+  "homepage": "https://github.com/jsdvjx/dshn#readme",
+  "bugs": "https://github.com/jsdvjx/dshn/issues",
+  "repository": { "type": "git", "url": "git+https://github.com/jsdvjx/dshn.git" },
+  "scripts": {
+    "build": "pnpm -r --filter './packages/*' run build",
+    "dev": "pnpm -r --parallel --filter './packages/*' exec tsc -p tsconfig.json -w --preserveWatchOutput",
+    "test": "vitest run",
+    "relay": "node packages/relay/lib/index.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0"
+  }
+}

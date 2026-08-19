@@ -1,0 +1,12 @@
+node_modules/
+lib/
+dist/
+*.tsbuildinfo
+*.log
+
+# Local agent/relay state — never commit credentials or claim data
+.dshn-state.json
+.dshn-agent.json
+tunnels.json
+claims.json
+*.pem
