@@ -111,7 +111,20 @@ Agent environment (all optional; sensible defaults):
 | `DSHN_STATE` | `~/.dsh/dshn-agent.json` | legacy state file (creds now live in `settings.yaml`) |
 | `DSH_HOME` | `~/.dsh` | dsh home directory |
 
-## Run the relay (your server)
+## Self-host your own network
+
+You don't have to use `ds.hn` — run the whole thing on your own domain. The relay
+ships as **`@dshn/relay`** (npm) and a Docker image; your agents point at it with
+`DSHN_RELAY_HOST`. Full guide, including DNS + TLS options: **[SELF-HOSTING.md](./SELF-HOSTING.md)**.
+
+```sh
+# your server
+DSHN_APEX=tunnel.example.com DSHN_COOKIE_SECRET=$(openssl rand -hex 32) npx @dshn/relay
+# your dsh
+DSHN_RELAY_HOST=wss://tunnel.example.com dsh --profile web
+```
+
+Or from source:
 
 ```sh
 pnpm install && pnpm build

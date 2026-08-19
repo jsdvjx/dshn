@@ -1,0 +1,12 @@
+.git
+node_modules
+**/node_modules
+dist
+**/lib
+*.log
+*.tsbuildinfo
+*.pem
+.dshn-state.json
+.dshn-agent.json
+claims.json
+tunnels.json

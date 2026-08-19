@@ -57,13 +57,38 @@ writeFileSync('dist/dshn/package.json', JSON.stringify({
 }, null, 2) + '\n')
 
 // ── relay ─────────────────────────────────────────────────────────────────
+// Shipped as the self-hostable `@dshn/relay` npm package: one bundled file with
+// a shebang so `npx @dshn/relay` / the installed `dshn-relay` bin runs directly.
 mkdirSync('dist/relay', { recursive: true })
 await esbuild.build({
   entryPoints: ['packages/relay/lib/index.js'],
   bundle: true, platform: 'node', target: 'node20', format: 'esm',
   outfile: 'dist/relay/relay.mjs',
   external: nativeOptional,
+  // The relay source keeps its `#!/usr/bin/env node` shebang; esbuild preserves
+  // it as line 1 and inserts this banner after it, so the bundle runs as a bin.
   banner,
 })
+copyFileSync('SELF-HOSTING.md', 'dist/relay/README.md')
+copyFileSync('LICENSE', 'dist/relay/LICENSE')
+writeFileSync('dist/relay/package.json', JSON.stringify({
+  name: '@dshn/relay',
+  version: '0.1.2',
+  description: 'Self-hostable ds.hn-style relay: a login-gated *.<apex> tunnel router that bridges public requests to dshn agents.',
+  keywords: ['dsh', 'deepseek-harness', 'tunnel', 'relay', 'self-hosted', 'reverse-tunnel', 'ds.hn'],
+  license: 'MIT',
+  author: 'jsdvjx',
+  homepage: 'https://github.com/jsdvjx/dshn/blob/main/SELF-HOSTING.md',
+  bugs: 'https://github.com/jsdvjx/dshn/issues',
+  repository: { type: 'git', url: 'git+https://github.com/jsdvjx/dshn.git', directory: 'packages/relay' },
+  type: 'module',
+  bin: { 'dshn-relay': 'relay.mjs' },
+  main: 'relay.mjs',
+  files: ['relay.mjs', 'README.md', 'LICENSE'],
+  engines: { node: '>=20' },
+  // Self-contained: ws + @dshn/protocol are inlined by esbuild. The optional
+  // native ws accelerators (bufferutil/utf-8-validate) stay external and ws
+  // falls back gracefully when they're absent, so there are zero install deps.
+}, null, 2) + '\n')
 
-console.log('dist built: dist/dshn (installable plugin), dist/relay/relay.mjs')
+console.log('dist built: dist/dshn (installable plugin), dist/relay (@dshn/relay, self-hostable)')
