@@ -48,6 +48,16 @@ import { deriveKey, newSalt, open as e2eOpen, seal as e2eSeal } from './crypto.j
 export const name = 'dshn-agent'
 
 /**
+ * Request header the agent stamps on EVERY request it replays from the tunnel to
+ * local dsh. The loopback-only `/dshn/*` management routes treat any request
+ * carrying it as non-local, which is the authoritative barrier against a remote
+ * (authenticated) visitor reaching them via path confusion — the Host-based
+ * loopback check alone cannot tell a replayed request from a genuinely local one,
+ * because every replay's Host is rewritten to loopback.
+ */
+const TUNNEL_MARKER = 'x-dshn-forwarded'
+
+/**
  * Injected services: the web server (listening port + our routes), and dsh's
  * settings service (so credentials persist into settings.yaml). Both are also
  * declared on the composition row — cordis reads the row's inject, so the module
@@ -673,23 +683,34 @@ export class AgentTunnel {
     const authority = this.loopbackAuthority()
     out.host = authority
     if (out.origin !== undefined) out.origin = `http://${authority}`
+    // Mark every replayed tunnel request. The /dshn/* management routes treat any
+    // request bearing this header as NON-local — so even a path-confusion bypass
+    // of the /dshn/ guard (e.g. `/api/../dshn/status` or `/%2e/dshn/status`, which
+    // dsh normalizes back to `/dshn/status`) cannot reach the loopback-only
+    // surface that reveals the password / e2e password / reconfigures the tunnel.
+    // This boundary is independent of how the path is parsed or normalized.
+    out[TUNNEL_MARKER] = '1'
     return out
   }
 
   /** Replay one HTTP request against local dsh and stream the response back. */
   private openRequest(id: number, method: string, path: string, headers: HeaderList): void {
-    const bare = path.split('?', 1)[0]
     // The agent's own /dshn/* management routes must NEVER be reachable through
     // the tunnel — the loopback rewrite would otherwise make them look local and
-    // leak the password / allow remote reconfigure. (The /dshn-e2e info route is
-    // a different, deliberately-public prefix and stays reachable.)
-    if (bare.startsWith('/dshn/')) {
+    // leak the password / allow remote reconfigure. The TUNNEL_MARKER header is
+    // the authoritative barrier; this normalized-path guard is defense-in-depth,
+    // rejecting dot-segment / percent-encoded forms (`/api/../dshn/status`,
+    // `/%2e/dshn/status`) that dsh would normalize back to `/dshn/…` before the
+    // request even reaches dsh. (The /dshn-e2e info route is a different,
+    // deliberately-public prefix and stays reachable.)
+    if (targetsManagementRoute(path)) {
       this.send({ t: 'res_head', id, status: 404, headers: [['content-type', 'text/plain']] })
       this.sendData(DATA_RES_BODY, id, Buffer.from('not found'))
       this.send({ t: 'res_end', id })
       return
     }
     this.served += 1
+    const bare = path.split('?', 1)[0]
     const outHeaders = this.loopbackHeaders(headers)
 
     // When E2E is on, /api bodies are sealed: buffer the request whole so it can
@@ -828,7 +849,35 @@ export class AgentTunnel {
  * over the public URL, and a public visitor (already past the relay login) must
  * not be able to read or change the credentials.
  */
-function isLoopbackRequest(req: http.IncomingMessage): boolean {
+/**
+ * Whether a tunnelled request path targets the agent's own `/dshn/*` management
+ * routes after the kind of normalization dsh applies — percent-decoding and
+ * resolving `.`/`..`/`//` segments. A naive `startsWith('/dshn/')` misses
+ * `/api/../dshn/status`, `/%2e/dshn/status`, etc., which dsh normalizes back to
+ * `/dshn/status`. Only the routing decision uses this; the original path is still
+ * forwarded verbatim to dsh.
+ */
+export function targetsManagementRoute(rawPath: string): boolean {
+  let p = rawPath.split('?', 1)[0].split('#', 1)[0]
+  try { p = decodeURIComponent(p) } catch { /* malformed %-escape: judge the raw form */ }
+  p = p.replace(/\\/g, '/')
+  const segs: string[] = []
+  for (const seg of p.split('/')) {
+    if (seg === '' || seg === '.') continue
+    if (seg === '..') { segs.pop(); continue }
+    segs.push(seg)
+  }
+  const norm = '/' + segs.join('/')
+  return norm === '/dshn' || norm.startsWith('/dshn/')
+}
+
+export function isLoopbackRequest(req: http.IncomingMessage): boolean {
+  // A request the agent itself replayed from the tunnel is NEVER local — however
+  // its Host was rewritten to loopback and however dsh normalized its path. This
+  // marker (set on every replay in loopbackHeaders) is the authoritative boundary
+  // for the password-revealing management routes; the Host check below alone is
+  // not, because replayed requests all carry a loopback Host.
+  if (req.headers[TUNNEL_MARKER] !== undefined) return false
   const host = String(req.headers.host ?? '')
   // Strip the port and any IPv6 brackets, then match the loopback hostnames.
   const hostname = host.replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase()
