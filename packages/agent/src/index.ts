@@ -121,6 +121,10 @@ interface Credentials {
   e2ePassword?: string
   /** Public salt for the e2e key derivation, generated once and persisted. */
   e2eSalt?: string
+  /** Self-hosted relay authority (overrides the env/default `relay.ds.hn`); empty = default. */
+  relayHost?: string
+  /** PEM (inline content) to pin a self-signed self-hosted relay; empty = none. */
+  originCa?: string
 }
 
 /**
@@ -140,6 +144,8 @@ const CREDS_SCHEMA = z.object({
   password: z.string().role('secret').default(''),
   e2ePassword: z.string().role('secret').default(''),
   e2eSalt: z.string().default(''),
+  relayHost: z.string().default(''),
+  originCa: z.string().default(''),
 })
 
 /** Read a credentials JSON file, or null. */
@@ -152,6 +158,8 @@ function readCredsFile(path: string): Credentials | null {
         password: raw.password,
         e2ePassword: typeof raw.e2ePassword === 'string' && raw.e2ePassword !== '' ? raw.e2ePassword : undefined,
         e2eSalt: typeof raw.e2eSalt === 'string' ? raw.e2eSalt : undefined,
+        relayHost: typeof raw.relayHost === 'string' && raw.relayHost !== '' ? raw.relayHost : undefined,
+        originCa: typeof raw.originCa === 'string' && raw.originCa !== '' ? raw.originCa : undefined,
       }
     }
   } catch {
@@ -184,7 +192,7 @@ export function settingsStore(scope: any, migrateFrom: string[]): CredsStore {
     load: () => {
       const v = scope.get() ?? {}
       return typeof v.subdomain === 'string' && v.subdomain !== ''
-        ? { subdomain: v.subdomain, password: v.password ?? '', e2ePassword: v.e2ePassword || undefined, e2eSalt: v.e2eSalt || undefined }
+        ? { subdomain: v.subdomain, password: v.password ?? '', e2ePassword: v.e2ePassword || undefined, e2eSalt: v.e2eSalt || undefined, relayHost: v.relayHost || undefined, originCa: v.originCa || undefined }
         : null
     },
     save: (creds) => {
@@ -193,6 +201,8 @@ export function settingsStore(scope: any, migrateFrom: string[]): CredsStore {
         password: creds?.password ?? '',
         e2ePassword: creds?.e2ePassword ?? '',
         e2eSalt: creds?.e2eSalt ?? '',
+        relayHost: creds?.relayHost ?? '',
+        originCa: creds?.originCa ?? '',
       })).catch(() => {})
     },
   }
@@ -362,13 +372,18 @@ export class AgentTunnel {
    * mirrors the relay's so the user sees the error locally before a round trip.
    * @returns null on success, or a human-readable error.
    */
-  configure(subdomain: string, password: string): string | null {
+  configure(subdomain: string, password: string, relayHost?: string, originCa?: string): string | null {
     const label = String(subdomain).trim().toLowerCase()
     if (!isValidSubdomainLabel(label)) return 'Invalid subdomain: 4–32 lowercase letters, digits or hyphens (not reserved).'
     if (String(password).length < 8) return 'Password must be at least 8 characters.'
+    // Self-hosted relay overrides (optional): a passed string replaces the setting
+    // (empty clears it → back to the env/default relay); undefined keeps the
+    // current one. Lets a self-hoster point at their own relay from the UI.
+    const rh = typeof relayHost === 'string' ? relayHost.trim() : (this.creds?.relayHost ?? '')
+    const ca = typeof originCa === 'string' ? originCa.trim() : (this.creds?.originCa ?? '')
     // The e2e password is managed independently (setE2E); a subdomain/password
     // change preserves it untouched.
-    this.creds = { subdomain: label, password: String(password), e2ePassword: this.creds?.e2ePassword, e2eSalt: this.creds?.e2eSalt }
+    this.creds = { subdomain: label, password: String(password), e2ePassword: this.creds?.e2ePassword, e2eSalt: this.creds?.e2eSalt, relayHost: rh || undefined, originCa: ca || undefined }
     this.refreshE2E()
     this.saveCreds(this.creds)
     this.status.configured = true
@@ -422,11 +437,31 @@ export class AgentTunnel {
     return { enabled: this.e2eKey !== null, salt: this.e2eSalt }
   }
 
+  /** The relay authority actually dialled: the user's self-hosted override if set, else the env/default. */
+  private effectiveRelayHost(): string {
+    const c = this.creds?.relayHost
+    return typeof c === 'string' && c !== '' ? c : this.config.relayHost
+  }
+
+  /** The origin CA to pin, as PEM bytes: inline PEM from the UI, or an env-configured file path. */
+  private effectiveOriginCa(): Buffer | null {
+    const raw = (this.creds?.originCa && this.creds.originCa !== '') ? this.creds.originCa : this.config.originCa
+    if (raw === '' || raw === undefined) return null
+    if (raw.includes('BEGIN CERTIFICATE')) return Buffer.from(raw) // inline PEM pasted in the UI
+    try { return readFileSync(raw) } catch { return null } // a file path (env DSHN_ORIGIN_CA)
+  }
+
+  /** The raw self-hosted overrides, for the settings UI to pre-fill (loopback callers only). */
+  relaySettings(): { relayHost: string; originCa: string } {
+    return { relayHost: this.creds?.relayHost ?? '', originCa: this.creds?.originCa ?? '' }
+  }
+
   /** Connection details for the local panel (relay, mode, uptime, latency, throughput). */
   info(): { relayHost: string; direct: boolean; connectedSince: number | null; served: number; localPort: number; latencyMs: number | null } {
-    const direct = /^wss?:\/\//.test(this.config.relayHost) || this.config.originCa !== ''
+    const host = this.effectiveRelayHost()
+    const direct = /^wss?:\/\//.test(host) || this.effectiveOriginCa() !== null
     return {
-      relayHost: this.config.relayHost.replace(/^wss?:\/\//, '').replace(/\/.*$/, ''),
+      relayHost: host.replace(/^wss?:\/\//, '').replace(/\/.*$/, ''),
       direct,
       connectedSince: this.connectedSince,
       served: this.served,
@@ -481,20 +516,16 @@ export class AgentTunnel {
       this.reconnectTimer = null
     }
     // Bare host → wss:// (behind Cloudflare in production); a full ws(s):// URL
-    // is honoured as-is so a loopback test can drive a plain-ws relay.
-    const base = this.config.relayHost.includes('://') ? this.config.relayHost : `wss://${this.config.relayHost}`
+    // is honoured as-is so a loopback test can drive a plain-ws relay. The host is
+    // the user's self-hosted override when set, else the env/default relay.
+    const relayHost = this.effectiveRelayHost()
+    const base = relayHost.includes('://') ? relayHost : `wss://${relayHost}`
     const wsOpts: Record<string, unknown> = { maxPayload: 512 * 1024 * 1024 }
-    // The tunnel connects straight to the origin, NOT through Cloudflare: CF
-    // resets a websocket carrying sustained bulk data. When the origin uses a
-    // private cert, pin it (pass it as the sole CA) so validation stays strict
-    // without a public CA — more precise than trusting the whole web PKI.
-    if (this.config.originCa !== '') {
-      try {
-        wsOpts.ca = readFileSync(this.config.originCa)
-      } catch (err) {
-        this.status.lastError = `cannot read origin CA: ${(err as Error).message}`
-      }
-    }
+    // Pin a self-signed relay's cert (as the sole CA) so validation stays strict
+    // without a public CA. Also used for a direct off-Cloudflare origin. The PEM
+    // is either pasted inline in the UI or an env-configured file path.
+    const ca = this.effectiveOriginCa()
+    if (ca !== null) wsOpts.ca = ca
     const ws = new WebSocket(`${base}${AGENT_WS_PATH}`, wsOpts)
     this.control = ws
     if (process.env.DSHN_DEBUG) console.error(`[dshn-agent] connect() opening new ws (backoff=${this.backoffMs})`)
@@ -962,12 +993,17 @@ export function apply(ctx: any, rawConfig: Partial<AgentConfig> | undefined): vo
         subdomain: tunnel.status.subdomain,
         lastError: tunnel.status.lastError,
         configurable: loopback,
-        apex: publicApex(config.relayHost),
+        apex: publicApex(info.relayHost),
         // The saved password is the only recoverable copy (cloud stores a hash).
         // Only ever handed to a loopback caller — the local machine's owner.
         password: loopback ? tunnel.revealPassword() : null,
         e2ePassword: loopback ? tunnel.revealE2EPassword() : null,
         e2eEnabled: tunnel.e2eInfo().enabled,
+        // Self-hosted relay overrides, so the settings UI can pre-fill them
+        // (loopback only). `defaultRelayHost` is what an empty override falls back
+        // to, shown as the field's placeholder.
+        relaySettings: loopback ? tunnel.relaySettings() : null,
+        defaultRelayHost: config.relayHost,
         // Connection details for the panel.
         relayHost: info.relayHost,
         mode: info.direct ? 'direct' : 'cloudflare',
@@ -991,8 +1027,9 @@ export function apply(ctx: any, rawConfig: Partial<AgentConfig> | undefined): vo
     },
   })
 
-  // Configure: the setup dialog POSTs { subdomain, password } here. Loopback
-  // only — a public caller must never set another machine's credentials.
+  // Configure: the setup dialog POSTs { subdomain, password } here (plus optional
+  // { relayHost, originCa } for self-hosted relays). Loopback only — a public
+  // caller must never set another machine's credentials or relay target.
   const disposeConfigure = ctx.webServer.register({
     kind: 'exact',
     path: '/dshn/configure',
@@ -1003,7 +1040,9 @@ export function apply(ctx: any, rawConfig: Partial<AgentConfig> | undefined): vo
       if (body === null || typeof body.subdomain !== 'string' || typeof body.password !== 'string') {
         return json(res, 400, { error: 'expected { subdomain, password }' })
       }
-      const err = tunnel.configure(body.subdomain, body.password)
+      const relayHost = typeof body.relayHost === 'string' ? body.relayHost : undefined
+      const originCa = typeof body.originCa === 'string' ? body.originCa : undefined
+      const err = tunnel.configure(body.subdomain, body.password, relayHost, originCa)
       if (err !== null) return json(res, 400, { error: err })
       json(res, 200, { ok: true, subdomain: tunnel.status.subdomain })
     },
