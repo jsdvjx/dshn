@@ -482,7 +482,6 @@ window.__ModuleLoader__.load({
     function Panel(props) {
       const s = props.status
       const configured = s.configured
-      const apex = s.apex || 'ds.hn'
       const [prefix, setPrefix] = react.useState(configured ? (s.subdomain || '') : '')
       const [pw, setPw] = react.useState(configured ? (s.password || '') : '')
       const [confirm, setConfirm] = react.useState('')
@@ -516,6 +515,19 @@ window.__ModuleLoader__.load({
         if (rs.relayHost && relayHost === '') { setRelayHost(rs.relayHost); setShowAdvanced(true) }
         if (rs.originCa && originCa === '') setOriginCa(rs.originCa)
       }, [s.relaySettings && s.relaySettings.relayHost])
+
+      // The domain suffix reflects the self-hosted relay AS YOU TYPE it (a
+      // client-side mirror of the server's apex derivation), so the preview shows
+      // YOUR domain — not the default ds.hn — before you've connected. Empty →
+      // the server's current apex.
+      const apex = (() => {
+        const rh = relayHost.trim()
+        if (rh === '') return s.apex || 'ds.hn'
+        const bare = rh.replace(/^wss?:\/\//, '').replace(/:\d+$/, '').replace(/\/.*$/, '')
+        const parts = bare.split('.')
+        if (parts.length > 2 && (parts[0] === 'relay' || parts[0] === 'origin')) return parts.slice(1).join('.')
+        return bare || (s.apex || 'ds.hn')
+      })()
 
       const copyText = (text, tag) => {
         if (!text || !navigator.clipboard) return
