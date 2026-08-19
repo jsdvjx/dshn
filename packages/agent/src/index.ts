@@ -45,7 +45,7 @@ import {
 } from '@dshn/protocol'
 import { deriveKey, newSalt, open as e2eOpen, seal as e2eSeal } from './crypto.js'
 
-export const name = 'dshn-agent'
+export const name = '@dshn/agent'
 
 /**
  * Request header the agent stamps on EVERY request it replays from the tunnel to

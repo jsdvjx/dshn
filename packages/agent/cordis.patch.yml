@@ -12,8 +12,8 @@
 # configured here, all with sensible defaults, so `dsh plugin add` then a normal
 # local launch is enough — the dialog does the rest.
 - insert:
-    - id: dshn-agent
-      name: 'dshn-agent'
+    - id: dshn
+      name: '@dshn/agent'
       inject: [webServer, settings]
       config:
         enabled: !!js (process.env.DSHN_ENABLED ?? '1') !== '0'

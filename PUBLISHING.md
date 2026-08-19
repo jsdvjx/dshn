@@ -10,11 +10,11 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-CI builds `dist/dshn-agent`, packs it, and attaches `dshn-agent.tgz` to the
+CI builds `dist/dshn`, packs it, and attaches `dshn.tgz` to the
 release. Verify the tarball resolves:
 
 ```sh
-curl -IL https://github.com/jsdvjx/dshn/releases/latest/download/dshn-agent.tgz
+curl -IL https://github.com/jsdvjx/dshn/releases/latest/download/dshn.tgz
 ```
 
 ## 2. Repo hygiene (awesome-dsh-plugin requirements)

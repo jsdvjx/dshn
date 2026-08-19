@@ -1,5 +1,5 @@
 // Produce self-contained, shippable artifacts under dist/:
-//   dist/dshn-agent/   — the dsh plugin, ws + @dshn/protocol inlined, cordis and
+//   dist/dshn/   — the dsh plugin, ws + @dshn/protocol inlined, cordis and
 //                        schemastery left external (dsh provides them at runtime)
 //   dist/relay/relay.mjs — the relay as one file (what gets deployed to a server)
 // Bundling frees `dsh plugin add` from resolving the file:../protocol workspace
@@ -17,24 +17,24 @@ const nativeOptional = ['bufferutil', 'utf-8-validate']
 rmSync('dist', { recursive: true, force: true })
 
 // ── agent plugin ────────────────────────────────────────────────────────────
-mkdirSync('dist/dshn-agent/lib', { recursive: true })
+mkdirSync('dist/dshn/lib', { recursive: true })
 await esbuild.build({
   entryPoints: ['packages/agent/lib/index.js'],
   bundle: true, platform: 'node', target: 'node20', format: 'esm',
-  outfile: 'dist/dshn-agent/lib/index.js',
+  outfile: 'dist/dshn/lib/index.js',
   // The agent imports nothing from dsh (it types ctx as any), so the bundle is
   // fully self-contained: ws and @dshn/protocol are inlined, and only the
   // optional native ws accelerators stay external.
   external: [...nativeOptional],
   banner,
 })
-copyFileSync('packages/agent/client.js', 'dist/dshn-agent/client.js')
-copyFileSync('packages/agent/cordis.patch.yml', 'dist/dshn-agent/cordis.patch.yml')
-copyFileSync('README.md', 'dist/dshn-agent/README.md')
-copyFileSync('LICENSE', 'dist/dshn-agent/LICENSE')
-writeFileSync('dist/dshn-agent/package.json', JSON.stringify({
-  name: 'dshn-agent',
-  version: '0.1.1',
+copyFileSync('packages/agent/client.js', 'dist/dshn/client.js')
+copyFileSync('packages/agent/cordis.patch.yml', 'dist/dshn/cordis.patch.yml')
+copyFileSync('README.md', 'dist/dshn/README.md')
+copyFileSync('LICENSE', 'dist/dshn/LICENSE')
+writeFileSync('dist/dshn/package.json', JSON.stringify({
+  name: '@dshn/agent',
+  version: '0.1.2',
   description: 'Forward a local dsh web service to the public internet over ds.hn (bundled).',
   keywords: ['dsh', 'dsh-plugin', 'deepseek-harness', 'tunnel', 'forwarding', 'ds.hn'],
   license: 'MIT',
@@ -51,7 +51,7 @@ writeFileSync('dist/dshn-agent/package.json', JSON.stringify({
     client: { platform: 'web', inject: ['@deepseek-ai/dsh-client-runtime', '@deepseek-ai/dsh-client-ui-layout'] },
   },
   // No runtime dependencies: schemastery, ws, and @dshn/protocol are all inlined
-  // by esbuild, so `npm i dshn-agent` (or `dsh plugin add dshn-agent`) pulls a
+  // by esbuild, so `npm i dshn` (or `dsh plugin add dshn`) pulls a
   // single self-contained package. cordis is provided by the dsh host at runtime.
   peerDependencies: { '@deepseek-ai/cordis': '*' },
 }, null, 2) + '\n')
@@ -66,4 +66,4 @@ await esbuild.build({
   banner,
 })
 
-console.log('dist built: dist/dshn-agent (installable plugin), dist/relay/relay.mjs')
+console.log('dist built: dist/dshn (installable plugin), dist/relay/relay.mjs')

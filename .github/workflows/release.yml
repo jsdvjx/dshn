@@ -2,7 +2,7 @@ name: release
 
 # Tag a version (e.g. `git tag v0.1.0 && git push --tags`) to build the plugin
 # and attach a prebuilt tarball to the GitHub release. The awesome-dsh-plugin
-# entry's `tarball:` field points at releases/latest/download/dshn-agent.tgz.
+# entry's `tarball:` field points at releases/latest/download/dshn.tgz.
 on:
   push:
     tags:
@@ -30,10 +30,10 @@ jobs:
         run: node scripts/build-dist.mjs
       - name: pack the plugin tarball
         run: |
-          npm pack ./dist/dshn-agent --pack-destination .
-          mv dshn-agent-*.tgz dshn-agent.tgz
+          npm pack ./dist/dshn --pack-destination .
+          mv dshn-*.tgz dshn.tgz
       - name: publish release with the tarball
         uses: softprops/action-gh-release@v2
         with:
-          files: dshn-agent.tgz
+          files: dshn.tgz
           generate_release_notes: true

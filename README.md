@@ -43,7 +43,7 @@ Cloudflare edge  (*.ds.hn proxied / orange-cloud)     free DDoS, WAF, TLS,
 relay  (your server, @dshn/relay)                      login gate + subdomain
   │  one WSS per device (multiplexed)                   claim store; moves bytes
   ▼
-dshn-agent  (the dsh plugin, on the user's machine)    replays HTTP + WS to dsh,
+dshn  (the dsh plugin, on the user's machine)    replays HTTP + WS to dsh,
   │  http://127.0.0.1:<dsh port>                        Host/Origin rewritten to loopback
   ▼
 dsh  (local web server)                                fence sees a loopback request
@@ -65,7 +65,7 @@ dsh  (local web server)                                fence sees a loopback req
 | package | what it is | runs where |
 |---|---|---|
 | `@dshn/protocol` | the WSS frame contract both ends compile against | shared |
-| `dshn-agent` | the dsh plugin: setup form + outbound tunnel + status widget + e2e | user's machine, inside dsh |
+| `dshn` | the dsh plugin: setup form + outbound tunnel + status widget + e2e | user's machine, inside dsh |
 | `@dshn/relay` | login gate + claim store + subdomain router + HTTP/WS bridge | your server, behind Cloudflare |
 
 The claim store (`packages/relay/src/claims.ts`) is trust-on-first-use for now;
@@ -76,23 +76,23 @@ an account-backed control plane replaces it later.
 From npm (recommended — one command, fully self-contained):
 
 ```sh
-dsh plugin --profile web add dshn-agent
+dsh plugin --profile web add @dshn/agent
 dsh --profile web
 ```
 
 Or a prebuilt tarball from the latest GitHub release:
 
 ```sh
-curl -L -o dshn-agent.tgz \
-  https://github.com/jsdvjx/dshn/releases/latest/download/dshn-agent.tgz
-dsh plugin --profile web add ./dshn-agent.tgz
+curl -L -o dshn.tgz \
+  https://github.com/jsdvjx/dshn/releases/latest/download/dshn.tgz
+dsh plugin --profile web add ./dshn.tgz
 ```
 
 Or build from source:
 
 ```sh
 pnpm install && node scripts/build-dist.mjs
-dsh plugin --profile web add ./dist/dshn-agent
+dsh plugin --profile web add ./dist/dshn
 dsh --profile web
 ```
 

@@ -11,7 +11,7 @@
 // this local copy is the only recovery). A bottom-left pill reflects status and
 // opens the panel; the panel has an explicit ✕ to close.
 window.__ModuleLoader__.load({
-  id: 'dshn-agent',
+  id: '@dshn/agent',
   factory: (require) => {
     var module = { exports: {} }
     var exports = module.exports
@@ -19,7 +19,7 @@ window.__ModuleLoader__.load({
     const react = require('react')
     const h = react.createElement
 
-    const ID = 'dshn-agent'
+    const ID = 'dshn'
     const POLL_MS = 2500
     const MIN_PW = 8
     const E2E_HEADER = 'x-dshn-e2e'
