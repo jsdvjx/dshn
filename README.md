@@ -1,7 +1,10 @@
 # dshn — DeepSeek Harness Network
 
+**English** · [中文](./README.zh.md)
+
+[![awesome · DSH plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com/)
+[![npm](https://img.shields.io/npm/v/@dshn/agent?label=%40dshn%2Fagent&color=cb3837)](https://www.npmjs.com/package/@dshn/agent)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![dsh-plugin](https://img.shields.io/badge/dsh-plugin-6aa84f.svg)](https://awesome-dsh-plugin.com/)
 
 Expose a locally-running **DeepSeek Harness** (`dsh`) web UI to the public
 internet under a `*.ds.hn` subdomain, gated by a login. Install the plugin, open
@@ -70,7 +73,7 @@ dsh  (local web server)                                fence sees a loopback req
 | package | what it is | runs where |
 |---|---|---|
 | `@dshn/protocol` | the WSS frame contract both ends compile against | shared |
-| `dshn` | the dsh plugin: setup form + outbound tunnel + status widget + e2e | user's machine, inside dsh |
+| `@dshn/agent` | the dsh plugin: setup form + outbound tunnel + status widget + e2e | user's machine, inside dsh |
 | `@dshn/relay` | login gate + claim store + subdomain router + HTTP/WS bridge | your server, behind Cloudflare |
 
 The claim store (`packages/relay/src/claims.ts`) is trust-on-first-use for now;
@@ -135,22 +138,21 @@ Or from source:
 
 ```sh
 pnpm install && pnpm build
-DSHN_COOKIE_SECRET=$(openssl rand -hex 32) \
-DSHN_APEX=ds.hn \
-DSHN_RELAY_PORT=8787 \
-DSHN_CLAIMS=./claims.json \
-DSHN_TLS_CERT=./cert.pem DSHN_TLS_KEY=./key.pem \
-  node packages/relay/lib/index.js
+node packages/relay/lib/index.js --apex ds.hn --data-dir ./dshn-data
 ```
 
-| var | required | purpose |
-|---|---|---|
-| `DSHN_COOKIE_SECRET` | ✅ | HMAC secret for session cookies (rotating it logs everyone out) |
-| `DSHN_APEX` | — (`ds.hn`) | apex domain the wildcard hangs off |
-| `DSHN_RELAY_PORT` | — (`8787`) | listen port |
-| `DSHN_CLAIMS` | — | JSON file the relay creates/maintains (subdomain → scrypt hash) |
-| `DSHN_TLS_CERT` / `DSHN_TLS_KEY` | — | PEM paths to serve HTTPS directly (else plain HTTP behind CF) |
-| `DSHN_SITE` | — | apex landing-page HTML |
+The only setting you need is `--apex`. The cookie secret is auto-generated and
+persisted under `--data-dir` (no `openssl rand`), reused across restarts; every
+flag also has an env var (`DSHN_APEX`, …). `--help` lists them all:
+
+| flag | env | default | purpose |
+|---|---|---|---|
+| `--apex` | `DSHN_APEX` | `ds.hn` | apex the wildcard hangs off |
+| `--data-dir` | `DSHN_DATA_DIR` | `./dshn-data` | holds `claims.json` + the auto-generated `cookie-secret` |
+| `--port` | `DSHN_RELAY_PORT` | `8787` | listen port |
+| `--secret` | `DSHN_COOKIE_SECRET` | *(auto)* | cookie HMAC secret; set only to pin it |
+| `--tls-cert` / `--tls-key` | `DSHN_TLS_CERT` / `DSHN_TLS_KEY` | — | PEM paths to serve HTTPS directly (else plain HTTP behind CF) |
+| `--site` | `DSHN_SITE` | — | apex landing-page HTML |
 
 Cloudflare: proxy `*.ds.hn` (orange cloud) to the relay's origin. Harden the
 origin to accept only Cloudflare — firewall to the

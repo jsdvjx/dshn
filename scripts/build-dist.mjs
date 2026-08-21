@@ -31,6 +31,7 @@ await esbuild.build({
 copyFileSync('packages/agent/client.js', 'dist/dshn/client.js')
 copyFileSync('packages/agent/cordis.patch.yml', 'dist/dshn/cordis.patch.yml')
 copyFileSync('README.md', 'dist/dshn/README.md')
+copyFileSync('README.zh.md', 'dist/dshn/README.zh.md')
 copyFileSync('LICENSE', 'dist/dshn/LICENSE')
 writeFileSync('dist/dshn/package.json', JSON.stringify({
   name: '@dshn/agent',
@@ -45,7 +46,7 @@ writeFileSync('dist/dshn/package.json', JSON.stringify({
   type: 'module',
   main: 'lib/index.js',
   exports: { '.': './lib/index.js', './client': './client.js', './package.json': './package.json' },
-  files: ['lib', 'client.js', 'cordis.patch.yml', 'README.md', 'LICENSE'],
+  files: ['lib', 'client.js', 'cordis.patch.yml', 'README.md', 'README.zh.md', 'LICENSE'],
   dsh: {
     bundle: { patch: 'cordis.patch.yml' },
     client: { platform: 'web', inject: ['@deepseek-ai/dsh-client-runtime', '@deepseek-ai/dsh-client-ui-layout'] },
