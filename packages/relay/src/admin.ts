@@ -112,7 +112,7 @@ export function adminPage(apex: string): string {
   } }
   * { box-sizing:border-box; }
   body { margin:0; min-height:100vh; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--ink); }
-  .wrap { max-width:1040px; margin:0 auto; padding:24px 20px 60px; }
+  .wrap { max-width:1180px; margin:0 auto; padding:24px 20px 60px; }
   svg.i { width:15px; height:15px; flex:none; vertical-align:-2px; }
   header { display:flex; align-items:center; flex-wrap:wrap; gap:8px 10px; margin-bottom:20px; }
   h1 { font-size:16px; font-weight:600; margin:0; display:flex; align-items:center; gap:7px; }
@@ -186,7 +186,9 @@ export function adminPage(apex: string): string {
   .dev .ago { color:var(--ink3); white-space:nowrap; margin-left:5px; }
   .dim { color:var(--ink3); font-size:12px; white-space:nowrap; }
   .act { white-space:nowrap; text-align:right; }
-  .act .btn { padding:4px 8px; margin-left:4px; }
+  .act .btn { padding:5px; margin-left:5px; width:28px; height:26px; justify-content:center; }
+  .act .btn svg.i { width:14px; height:14px; }
+  .act .btn.gold:hover { border-color:#c9930f; color:#c9930f; }
   .act .btn.danger:hover { border-color:var(--bad); color:var(--bad); }
   .empty { padding:22px; text-align:center; color:var(--ink3); font-size:13px; }
   .banned { display:flex; flex-wrap:wrap; gap:8px; }
@@ -200,6 +202,39 @@ export function adminPage(apex: string): string {
     color:var(--bg); font-size:13px; padding:8px 16px; border-radius:9px; opacity:0; transition:opacity .2s; pointer-events:none;
     overflow-wrap:anywhere; text-align:center; }
   .toast.show { opacity:1; }
+  /* keep the Actions column pinned so its buttons are never clipped by the wide table */
+  table th:last-child, table td.act { position:sticky; right:0; background:var(--bg); z-index:1;
+    box-shadow:-10px 0 10px -10px rgba(0,0,0,.35); }
+  /* modal (replaces the browser's confirm/prompt) */
+  .modal-ov { position:fixed; inset:0; z-index:20; display:grid; place-items:center; padding:20px;
+    background:rgba(0,0,0,.45); opacity:0; transition:opacity .15s; }
+  .modal-ov.show { opacity:1; }
+  .modal { width:min(440px,94vw); background:var(--bg); border:1px solid var(--line); border-radius:14px;
+    padding:20px 22px 18px; box-shadow:0 24px 64px rgba(0,0,0,.45); transform:translateY(8px) scale(.98);
+    transition:transform .15s; }
+  .modal-ov.show .modal { transform:none; }
+  .modal h3 { margin:0 0 12px; font-size:16px; font-weight:600; overflow-wrap:anywhere; display:flex; align-items:center; gap:8px; }
+  .modal h3 svg.i { width:17px; height:17px; }
+  .modal.danger h3 { color:var(--bad); }
+  .modal p { margin:0 0 9px; font-size:13px; color:var(--ink2); line-height:1.5; overflow-wrap:anywhere; }
+  .modal-l { display:block; font-size:12px; color:var(--ink3); margin:15px 0 7px; }
+  .modal-l b { color:var(--ink); font-family:ui-monospace,Menlo,monospace; }
+  .modal-in { width:100%; box-sizing:border-box; padding:9px 11px; border-radius:9px; border:1px solid var(--line);
+    background:transparent; color:inherit; font:inherit; font-size:14px; font-family:ui-monospace,Menlo,monospace; }
+  .modal-in:focus { outline:none; border-color:var(--accent); }
+  .modal-btns { display:flex; justify-content:flex-end; gap:8px; margin-top:20px; }
+  .modal-btns .btn { padding:8px 16px; font-size:13px; }
+  .modal-ok { border-color:var(--accent); color:var(--ink); }
+  .modal-ok:hover { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .modal-ok.danger { border-color:var(--bad); color:var(--bad); }
+  .modal-ok.danger:hover { background:var(--bad); color:#fff; }
+  .modal-ok:disabled { opacity:.45; cursor:not-allowed; }
+  .modal-ok:disabled:hover { background:transparent; color:var(--bad); }
+  /* mobile: kill horizontal overflow and let tight labels/headers wrap instead of clipping */
+  html, body { max-width:100%; overflow-x:hidden; }
+  .tile .k { flex-wrap:wrap; }
+  h2 { flex-wrap:wrap; }
+  @media (max-width:520px) { .tiles { grid-template-columns:repeat(2,1fr); } }
 </style></head>
 <body><div class="wrap">
   <header>
@@ -357,8 +392,8 @@ function renderState(st) {
       ? '<span class="route on" title="premium since ' + esc(fmtDate(c.premium.since)) + (c.premium.dns ? ' · DNS record ' + esc(c.premium.dns.id) : ' · DNS manual') + '">' + icon('star') + 'premium</span>'
       : '<span class="route">standard</span>'
     const routeBtn = !st.premium ? '' : c.premium
-      ? '<button class="btn" data-premium="' + esc(c.subdomain) + '" data-on="0" title="Back to the standard route (via the CDN)">' + icon('route') + 'Standard</button>'
-      : '<button class="btn gold" data-premium="' + esc(c.subdomain) + '" data-on="1" title="Move onto the premium route (' + esc(st.premium.host) + ')">' + icon('star') + 'Premium</button>'
+      ? '<button class="btn" data-premium="' + esc(c.subdomain) + '" data-on="0" title="Switch to the standard route (via the CDN)" aria-label="Switch to standard route">' + icon('route') + '</button>'
+      : '<button class="btn gold" data-premium="' + esc(c.subdomain) + '" data-on="1" title="Switch to the premium route (' + esc(st.premium.host) + ')" aria-label="Switch to premium route">' + icon('star') + '</button>'
     return '<tr>'
       + '<td class="sub"><a href="https://' + esc(c.subdomain) + '.' + esc(st.apex) + '" target="_blank" rel="noopener">' + esc(c.subdomain) + icon('ext') + '</a></td>'
       + '<td>' + state + '</td>'
@@ -371,9 +406,9 @@ function renderState(st) {
       + '<td class="num">' + fmtBytes(c.traffic.bytesOut) + '</td>'
       + '<td class="act">'
       + routeBtn
-      + (c.online ? '<button class="btn" data-kick="' + esc(c.subdomain) + '" title="Drop live connections">' + icon('power') + 'Kick</button>' : '')
-      + '<button class="btn danger" data-release="' + esc(c.subdomain) + '" title="Delete the claim; name becomes free">' + icon('unlock') + 'Release</button>'
-      + '<button class="btn danger" data-ban="' + esc(c.subdomain) + '" title="Delete and block the name">' + icon('slash') + 'Ban</button></td>'
+      + (c.online ? '<button class="btn" data-kick="' + esc(c.subdomain) + '" title="Kick: drop live connections" aria-label="Kick">' + icon('power') + '</button>' : '')
+      + '<button class="btn danger" data-release="' + esc(c.subdomain) + '" title="Release: delete the claim; name becomes free" aria-label="Release">' + icon('unlock') + '</button>'
+      + '<button class="btn danger" data-ban="' + esc(c.subdomain) + '" title="Ban: delete and block the name" aria-label="Ban">' + icon('slash') + '</button></td>'
       + '</tr>'
   }).join('')
   $('rows').innerHTML = rows || '<tr><td colspan="10"><div class="empty">No claims yet.</div></td></tr>'
@@ -555,6 +590,45 @@ let resizeTimer
 window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderCharts, 150) })
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', renderCharts)
 
+/**
+ * A modern in-page confirm/prompt, replacing the browser's blocking dialogs.
+ * opts: { title, lines[], confirmLabel, danger, matchText }. Resolves to the
+ * typed value when matchText is set (only when it matches), true for a plain
+ * confirm, or null on cancel. Enter confirms, Esc / backdrop cancels.
+ */
+function askModal(opts) {
+  return new Promise((resolve) => {
+    const ov = document.createElement('div'); ov.className = 'modal-ov'
+    const card = document.createElement('div'); card.className = 'modal' + (opts.danger ? ' danger' : '')
+    let html = '<h3>' + (opts.danger ? icon('slash') : '') + esc(opts.title) + '</h3>'
+    for (const ln of (opts.lines || [])) html += '<p>' + esc(ln) + '</p>'
+    if (opts.matchText) html += '<label class="modal-l">Type <b>' + esc(opts.matchText) + '</b> to confirm</label>'
+      + '<input class="modal-in" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="confirmation">'
+    html += '<div class="modal-btns"><button class="btn modal-cancel" type="button">Cancel</button>'
+      + '<button class="btn modal-ok' + (opts.danger ? ' danger' : '') + '" type="button"' + (opts.matchText ? ' disabled' : '') + '>'
+      + esc(opts.confirmLabel || 'Confirm') + '</button></div>'
+    card.innerHTML = html
+    ov.appendChild(card); document.body.appendChild(ov)
+    requestAnimationFrame(() => ov.classList.add('show'))
+    const input = card.querySelector('.modal-in')
+    const ok = card.querySelector('.modal-ok')
+    const finish = (val) => { ov.classList.remove('show'); document.removeEventListener('keydown', onKey); setTimeout(() => ov.remove(), 160); resolve(val) }
+    const confirmVal = () => opts.matchText ? input.value : true
+    if (input) {
+      input.addEventListener('input', () => { ok.disabled = input.value !== opts.matchText })
+      setTimeout(() => input.focus(), 40)
+    } else setTimeout(() => ok.focus(), 40)
+    card.querySelector('.modal-cancel').addEventListener('click', () => finish(null))
+    ok.addEventListener('click', () => { if (!ok.disabled) finish(confirmVal()) })
+    ov.addEventListener('click', (e) => { if (e.target === ov) finish(null) })
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); finish(null) }
+      else if (e.key === 'Enter' && !ok.disabled) { e.preventDefault(); finish(confirmVal()) }
+    }
+    document.addEventListener('keydown', onKey)
+  })
+}
+
 async function act(path, subdomain, extra) {
   const res = await fetch(path, {
     method: 'POST',
@@ -571,10 +645,17 @@ document.addEventListener('click', async (e) => {
   if (premium) {
     const on = b.dataset.on === '1'
     const host = lastState && lastState.premium ? lastState.premium.host : '?'
-    const msg = on
-      ? 'Move "' + premium + '" onto the premium route?\\n\\nA dedicated DNS record points ' + premium + '.' + lastState.apex + ' at ' + host + ' (DNS only, bypassing the CDN); its agent is told to reconnect through that path. Visitors follow within the DNS TTL.'
-      : 'Move "' + premium + '" back to the standard route?\\n\\nIts dedicated DNS record is removed (the CDN wildcard takes over again) and its agent reconnects through the default relay host.'
-    if (!confirm(msg)) return
+    const apex = lastState ? lastState.apex : ''
+    const lines = on
+      ? ['A dedicated DNS record points ' + premium + '.' + apex + ' straight at ' + host + ' (DNS only, bypassing the CDN).',
+         'Its agent is asked to reconnect through that path; visitors follow within the DNS TTL.']
+      : ['The dedicated DNS record is removed and the CDN wildcard takes over again.',
+         'Its agent reconnects through the default relay host.']
+    const okd = await askModal({
+      title: (on ? 'Enable premium route for ' : 'Back to standard route for ') + premium,
+      lines, confirmLabel: on ? 'Enable premium' : 'Use standard',
+    })
+    if (!okd) return
     const r = await act('/__admin/api/premium', premium, { enabled: on })
     if (r) {
       if (!r.ok) toast('Route change failed: ' + (r.error || '?'))
@@ -583,18 +664,29 @@ document.addEventListener('click', async (e) => {
     }
     loadState()
   } else if (kick) {
-    if (!confirm('Kick every live device of "' + kick + '" offline? Their agents will auto-reconnect unless stopped.')) return
+    const okd = await askModal({
+      title: 'Kick ' + kick + ' offline?',
+      lines: ['Every live device is disconnected. Their agents auto-reconnect unless stopped.'],
+      confirmLabel: 'Kick',
+    })
+    if (!okd) return
     const r = await act('/__admin/api/kick', kick)
     if (r) toast(r.ok ? 'Kicked ' + r.kicked + ' device(s) of ' + kick : 'Kick failed: ' + (r.error || '?'))
     loadState()
   } else if (release) {
-    const typed = prompt('Release "' + release + '"?\\n\\nThis deletes the claim: the user is kicked offline, their password stops working, and the subdomain becomes claimable by anyone (including their own auto-reconnecting agent). Type the subdomain to confirm:')
+    const typed = await askModal({
+      title: 'Release ' + release + '?', danger: true, matchText: release, confirmLabel: 'Release',
+      lines: ['This deletes the claim: the user is kicked, their password stops working, and the name becomes claimable by anyone (including their own auto-reconnecting agent).'],
+    })
     if (typed !== release) { if (typed !== null) toast('Not released — name did not match.'); return }
     const r = await act('/__admin/api/release', release)
     if (r) toast(r.ok ? 'Released ' + release : 'Release failed: ' + (r.error || '?'))
     loadState()
   } else if (ban) {
-    const typed = prompt('Ban "' + ban + '"?\\n\\nThis kicks the user, deletes the claim, and blocks the subdomain from being claimed again until unbanned. Type the subdomain to confirm:')
+    const typed = await askModal({
+      title: 'Ban ' + ban + '?', danger: true, matchText: ban, confirmLabel: 'Ban',
+      lines: ['This kicks the user, deletes the claim, and blocks the subdomain from being claimed again until you unban it.'],
+    })
     if (typed !== ban) { if (typed !== null) toast('Not banned — name did not match.'); return }
     const r = await act('/__admin/api/ban', ban)
     if (r) toast(r.ok ? 'Banned ' + ban : 'Ban failed: ' + (r.error || '?'))
