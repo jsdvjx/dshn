@@ -118,6 +118,15 @@ export interface HelloFrame {
   device?: string
 }
 
+/**
+ * Which network path a tunnel rides. `standard` is the default (the relay's
+ * apex behind its CDN); `premium` is an operator-assigned accelerated path —
+ * the subdomain's DNS points at an edge node that proxies to the relay, and
+ * the agent dials that same hostname so its uplink takes the fast path too.
+ * Only the operator (admin panel) can assign it; an agent never chooses.
+ */
+export type TunnelRoute = 'standard' | 'premium'
+
 /** Relay → agent: the token was accepted; the tunnel is live. */
 export interface ReadyFrame {
   t: 'ready'
@@ -125,6 +134,25 @@ export interface ReadyFrame {
   subdomain: string
   /** The full public URL the browser uses. */
   publicUrl: string
+  /** The route this tunnel is assigned (absent on relays that predate routes = standard). */
+  route?: TunnelRoute
+  /**
+   * When `route` is `premium`: the authority the agent should dial instead of
+   * its default relay host (e.g. `alice.ds.hn`, or a full `ws(s)://` URL). The
+   * agent reconnects there if it is not already connected through it.
+   */
+  routeHost?: string
+}
+
+/**
+ * Relay → agent, mid-session: the operator changed this tunnel's route. Same
+ * fields as the route part of {@link ReadyFrame}; the agent reconnects through
+ * the new path. Agents that predate routes ignore the frame.
+ */
+export interface RouteFrame {
+  t: 'route'
+  route: TunnelRoute
+  routeHost?: string
 }
 
 /** Relay → agent: the token was rejected; the agent should stop, not retry blindly. */
@@ -215,6 +243,7 @@ export interface PongFrame {
 export type ControlFrame =
   | HelloFrame
   | ReadyFrame
+  | RouteFrame
   | DenyFrame
   | ReqHeadFrame
   | ReqEndFrame

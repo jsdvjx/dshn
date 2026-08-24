@@ -27,6 +27,20 @@ interface ClaimRecord {
    * claim's record cannot grow without limit.
    */
   devices?: Record<string, DeviceRecord>
+  /** Operator-assigned premium route, when this claim rides the accelerated path. */
+  premium?: PremiumRecord
+}
+
+/**
+ * A claim's premium-route assignment. Only the operator sets it (admin panel);
+ * the store just remembers it, plus the DNS record the relay created for it so
+ * the record can be removed again when the route is withdrawn.
+ */
+export interface PremiumRecord {
+  /** When the operator enabled the route (ms). */
+  since: number
+  /** The dedicated DNS record the relay manages for it (absent when DNS is manual). */
+  dns?: { id: string; content: string }
 }
 
 /** One device's last-known identity under a claim. */
@@ -175,12 +189,34 @@ export class ClaimStore {
     return Object.entries(devices).map(([id, d]) => ({ id, name: d.name, lastSeen: d.lastSeen }))
   }
 
+  /** The premium-route assignment of a claim, or null (unclaimed, or standard route). */
+  premiumOf(subdomain: string): PremiumRecord | null {
+    return this.claims.get(subdomain)?.premium ?? null
+  }
+
+  /**
+   * Assign or withdraw the premium route of a claim. Admin-only — an agent has
+   * no path to this; the route is the operator's to grant.
+   * @param subdomain - the claimed label.
+   * @param premium - the assignment, or null to return to the standard route.
+   * @returns false when no such claim exists.
+   */
+  setPremium(subdomain: string, premium: PremiumRecord | null): boolean {
+    const claim = this.claims.get(subdomain)
+    if (claim === undefined) return false
+    if (premium === null) delete claim.premium
+    else claim.premium = premium
+    this.persist()
+    return true
+  }
+
   /** Every claim, without password material — for the admin panel. */
-  list(): Array<{ subdomain: string; createdAt: number; devices: Array<{ id: string } & DeviceRecord> }> {
+  list(): Array<{ subdomain: string; createdAt: number; devices: Array<{ id: string } & DeviceRecord>; premium: PremiumRecord | null }> {
     return [...this.claims.entries()].map(([subdomain, c]) => ({
       subdomain,
       createdAt: c.createdAt,
       devices: Object.entries(c.devices ?? {}).map(([id, d]) => ({ id, name: d.name, lastSeen: d.lastSeen })),
+      premium: c.premium ?? null,
     }))
   }
 

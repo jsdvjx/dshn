@@ -417,6 +417,7 @@ window.__ModuleLoader__.load({
           savedHint: '手机访问用这个密码登录。忘记时点“复制/显示”取回。',
           weak: '弱', fair: '一般', good: '较强', strong: '强',
           infoRelay: '线路', infoMode: { direct: '直连源站', cloudflare: '经 Cloudflare' },
+          routePremium: '高级线路（加速）', routeStandard: '标准线路',
           infoUptime: '在线时长', infoServed: '已转发请求', infoPort: '本地端口', infoLatency: '延迟', infoDevice: '设备名',
           e2eLabel: '端到端密码（可选）', e2eHint: '设置后，会话内容用它加密，云端也看不到；密码不出本机。访问时需在网页再输一次。',
           e2eApply: '设置端到端密码', e2eUpdate: '更新端到端密码', e2eDisable: '关闭加密', e2eApplied: '✓ 端到端加密已开启', e2eOff2: '✓ 端到端加密已关闭', e2eIndep: '独立设置，不影响上面的连接。',
@@ -442,6 +443,7 @@ window.__ModuleLoader__.load({
           savedHint: 'Log in from a phone with this password. Copy/show it here if you forget.',
           weak: 'weak', fair: 'fair', good: 'good', strong: 'strong',
           infoRelay: 'Link', infoMode: { direct: 'direct to origin', cloudflare: 'via Cloudflare' },
+          routePremium: 'premium route (accelerated)', routeStandard: 'standard route',
           infoUptime: 'Uptime', infoServed: 'Requests served', infoPort: 'Local port', infoLatency: 'Latency', infoDevice: 'Device name',
           e2eLabel: 'End-to-end password (optional)', e2eHint: 'If set, session content is encrypted with it — even the cloud cannot read it, and it never leaves this machine. Visitors enter it again in the browser.',
           e2eApply: 'Set e2e password', e2eUpdate: 'Update e2e password', e2eDisable: 'Turn off', e2eApplied: '✓ End-to-end encryption on', e2eOff2: '✓ End-to-end encryption off', e2eIndep: 'Applied on its own — does not affect the connection above.',
@@ -478,6 +480,7 @@ window.__ModuleLoader__.load({
         P('M7 1.7c2.3 2.3 2.3 8.3 0 10.6'), P('M7 1.7c-2.3 2.3-2.3 8.3 0 10.6')],
       cloud: () => [P('M4.4 10.6a2.6 2.6 0 01.2-5.2 3.4 3.4 0 016.5.9 2.2 2.2 0 01-.4 4.3z')],
       plug: () => [P('M5 2.3v2.2M9 2.3v2.2'), P('M4 4.6h6v1.9a3 3 0 01-6 0z'), P('M7 9.4v2.3')],
+      bolt: () => [P('M7.6 1.8L3.3 7.8h3.1l-.8 4.4 4.3-6h-3.1z')],
       gauge: () => [P('M2.2 10.4a5 5 0 019.6 0'), P('M7 10.4l2.4-2.7'), h('circle', { key: 'd', cx: 7, cy: 10.4, r: .5, fill: 'currentColor' })],
       clock: () => [h('circle', { key: 'c', cx: 7, cy: 7, r: 5.3 }), P('M7 4.1v3.1l2 1.2')],
       swap: () => [P('M3.4 5h7.2l-2-2'), P('M10.6 9H3.4l2 2')],
@@ -641,9 +644,13 @@ window.__ModuleLoader__.load({
         })() : null,
 
         configured && s.connected ? h('div', { className: 'dshn-info' },
+          // The route is the operator's assignment (premium = accelerated path via
+          // the tunnel's own hostname); the mode is how the default relay is reached.
           h('div', { className: 'dshn-info-row' },
-            h('span', { className: 'dshn-info-k' }, Icon(s.mode === 'direct' ? 'plug' : 'cloud'), T.infoRelay),
-            h('span', { className: 'dshn-info-v' }, (T.infoMode[s.mode] || s.mode || '') + (s.relayHost ? ' · ' + s.relayHost : ''))),
+            h('span', { className: 'dshn-info-k' }, Icon(s.route === 'premium' ? 'bolt' : s.mode === 'direct' ? 'plug' : 'cloud'), T.infoRelay),
+            h('span', { className: 'dshn-info-v', style: s.route === 'premium' ? { color: '#c9930f' } : undefined },
+              (s.route === 'premium' ? T.routePremium : s.route === 'standard' ? T.routeStandard + ' · ' + (T.infoMode[s.mode] || s.mode || '') : (T.infoMode[s.mode] || s.mode || ''))
+              + (s.relayHost ? ' · ' + s.relayHost : ''))),
           h('div', { className: 'dshn-info-row' },
             h('span', { className: 'dshn-info-k' }, Icon('gauge'), T.infoLatency),
             h('span', { className: 'dshn-info-v', style: { color: latColor(s.latencyMs) } }, s.latencyMs == null ? '—' : s.latencyMs + ' ms')),

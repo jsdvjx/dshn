@@ -43,6 +43,7 @@ import {
   E2E_PUB_PATH,
   type ControlFrame,
   type HeaderList,
+  type TunnelRoute,
 } from '@dshn/protocol'
 import { deriveKey, newSalt, open as e2eOpen, seal as e2eSeal } from './crypto.js'
 
@@ -126,6 +127,12 @@ interface Credentials {
   relayHost?: string
   /** PEM (inline content) to pin a self-signed self-hosted relay; empty = none. */
   originCa?: string
+  /**
+   * The authority the relay last told us to dial for the premium route (e.g.
+   * `alice.ds.hn`). Remembered so a restart dials the fast path straight away;
+   * cleared when the relay says the tunnel is back on the standard route.
+   */
+  routeHost?: string
 }
 
 /**
@@ -147,6 +154,7 @@ const CREDS_SCHEMA = z.object({
   e2eSalt: z.string().default(''),
   relayHost: z.string().default(''),
   originCa: z.string().default(''),
+  routeHost: z.string().default(''),
 })
 
 /** Read a credentials JSON file, or null. */
@@ -161,6 +169,7 @@ function readCredsFile(path: string): Credentials | null {
         e2eSalt: typeof raw.e2eSalt === 'string' ? raw.e2eSalt : undefined,
         relayHost: typeof raw.relayHost === 'string' && raw.relayHost !== '' ? raw.relayHost : undefined,
         originCa: typeof raw.originCa === 'string' && raw.originCa !== '' ? raw.originCa : undefined,
+        routeHost: typeof raw.routeHost === 'string' && raw.routeHost !== '' ? raw.routeHost : undefined,
       }
     }
   } catch {
@@ -193,7 +202,7 @@ export function settingsStore(scope: any, migrateFrom: string[]): CredsStore {
     load: () => {
       const v = scope.get() ?? {}
       return typeof v.subdomain === 'string' && v.subdomain !== ''
-        ? { subdomain: v.subdomain, password: v.password ?? '', e2ePassword: v.e2ePassword || undefined, e2eSalt: v.e2eSalt || undefined, relayHost: v.relayHost || undefined, originCa: v.originCa || undefined }
+        ? { subdomain: v.subdomain, password: v.password ?? '', e2ePassword: v.e2ePassword || undefined, e2eSalt: v.e2eSalt || undefined, relayHost: v.relayHost || undefined, originCa: v.originCa || undefined, routeHost: v.routeHost || undefined }
         : null
     },
     save: (creds) => {
@@ -204,6 +213,7 @@ export function settingsStore(scope: any, migrateFrom: string[]): CredsStore {
         e2eSalt: creds?.e2eSalt ?? '',
         relayHost: creds?.relayHost ?? '',
         originCa: creds?.originCa ?? '',
+        routeHost: creds?.routeHost ?? '',
       })).catch(() => {})
     },
   }
@@ -236,6 +246,28 @@ interface TunnelStatus {
   publicUrl: string | null
   subdomain: string | null
   lastError: string | null
+  /** The route the relay assigned (null until the first READY on a route-aware relay). */
+  route: TunnelRoute | null
+}
+
+/**
+ * Consecutive failed dials of the premium host before the agent falls back to
+ * its default relay host for a while. The relay then re-announces the route on
+ * READY, so the premium path is retried automatically each fallback period.
+ */
+const ROUTE_FAIL_MAX = 3
+/** How long a failed premium host is left alone before it is dialled again. */
+const ROUTE_FALLBACK_MS = 5 * 60_000
+
+/**
+ * A relay-supplied route host must be a plain authority (`host[:port]`) or a
+ * `ws(s)://` URL — nothing that could smuggle a path or credentials into the
+ * dial. Hostname chars only; the relay is trusted, the shape is checked.
+ */
+function isValidRouteHost(raw: unknown): raw is string {
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 253) return false
+  const bare = raw.replace(/^wss?:\/\//, '')
+  return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:\d{1,5})?$/i.test(bare)
 }
 
 /** Coerce a `ws` message payload to a single Buffer. */
@@ -339,6 +371,12 @@ export class AgentTunnel {
   private latencyMs: number | null = null
   /** ms epoch the outstanding latency ping was sent (0 = none in flight). */
   private pingSentAt = 0
+  /** The authority the current control socket was dialled through. */
+  private dialledHost: string | null = null
+  /** Consecutive dials of the premium host that died before READY. */
+  private routeFails = 0
+  /** Until when (ms epoch) the premium host is skipped in favour of the default relay. */
+  private routeFallbackUntil = 0
 
   constructor(private readonly config: AgentConfig, private readonly localPort: () => number, private readonly store: CredsStore) {
     this.deviceId = createHash('sha256').update(`${hostname()}|${config.statePath}`).digest('hex').slice(0, 12)
@@ -352,6 +390,7 @@ export class AgentTunnel {
       publicUrl: null,
       subdomain: this.creds?.subdomain ?? null,
       lastError: null,
+      route: null,
     }
   }
 
@@ -399,7 +438,11 @@ export class AgentTunnel {
     const ca = typeof originCa === 'string' ? originCa.trim() : (this.creds?.originCa ?? '')
     // The e2e password is managed independently (setE2E); a subdomain/password
     // change preserves it untouched.
-    this.creds = { subdomain: label, password: String(password), e2ePassword: this.creds?.e2ePassword, e2eSalt: this.creds?.e2eSalt, relayHost: rh || undefined, originCa: ca || undefined }
+    // A different subdomain (or relay) may be on a different route: forget the
+    // remembered premium host and let the relay announce it again on READY.
+    const sameTarget = this.creds?.subdomain === label && (this.creds?.relayHost ?? '') === (rh || '')
+    this.creds = { subdomain: label, password: String(password), e2ePassword: this.creds?.e2ePassword, e2eSalt: this.creds?.e2eSalt, relayHost: rh || undefined, originCa: ca || undefined, routeHost: sameTarget ? this.creds?.routeHost : undefined }
+    this.status.route = null
     this.refreshE2E()
     this.saveCreds(this.creds)
     this.status.configured = true
@@ -473,12 +516,17 @@ export class AgentTunnel {
   }
 
   /** Connection details for the local panel (relay, mode, uptime, latency, throughput). */
-  info(): { relayHost: string; direct: boolean; connectedSince: number | null; served: number; localPort: number; latencyMs: number | null } {
+  info(): { relayHost: string; direct: boolean; route: TunnelRoute | null; routeHost: string | null; connectedSince: number | null; served: number; localPort: number; latencyMs: number | null } {
     const host = this.effectiveRelayHost()
     const direct = /^wss?:\/\//.test(host) || this.effectiveOriginCa() !== null
+    // Once connected, report the authority actually in use (the premium host
+    // when on that route), not just the configured default.
+    const live = this.status.connected && this.dialledHost !== null ? this.dialledHost : host
     return {
-      relayHost: host.replace(/^wss?:\/\//, '').replace(/\/.*$/, ''),
+      relayHost: live.replace(/^wss?:\/\//, '').replace(/\/.*$/, ''),
       direct,
+      route: this.status.route,
+      routeHost: this.creds?.routeHost ?? null,
       connectedSince: this.connectedSince,
       served: this.served,
       localPort: this.localPort(),
@@ -494,6 +542,9 @@ export class AgentTunnel {
     this.status.connected = false
     this.status.publicUrl = null
     this.status.subdomain = null
+    this.status.route = null
+    this.routeFails = 0
+    this.routeFallbackUntil = 0
     if (this.reconnectTimer !== null) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
     this.control?.close()
     this.control = null
@@ -517,6 +568,84 @@ export class AgentTunnel {
     this.status.connected = false
   }
 
+  /**
+   * Which authority to dial: the relay-assigned premium host when one is
+   * remembered and not in a fallback period, else the default relay host. The
+   * premium host is only ever set by a route announcement from the relay.
+   */
+  private dialHost(): string {
+    const route = this.creds?.routeHost
+    if (route !== undefined && route !== '' && Date.now() >= this.routeFallbackUntil) return route
+    return this.effectiveRelayHost()
+  }
+
+  /** Whether the live control socket was dialled through the remembered premium host. */
+  private onPremiumPath(): boolean {
+    const route = this.creds?.routeHost
+    return route !== undefined && route !== '' && this.dialledHost === route
+  }
+
+  /** Whether the premium host is currently being skipped after repeated failures. */
+  private inRouteFallback(): boolean {
+    return Date.now() < this.routeFallbackUntil
+  }
+
+  /**
+   * Apply a route announcement (READY or a mid-session ROUTE frame).
+   *
+   * `status.route` reflects the OPERATOR'S ASSIGNMENT, because that is what a
+   * public visitor experiences: enabling premium points the subdomain's DNS at
+   * the accelerator, so browser traffic is accelerated no matter which host the
+   * agent's own control socket happens to use. Moving the control socket onto
+   * the premium host too is a best-effort bonus for the uplink — it may briefly
+   * fail while the fresh DNS record propagates, and if the host stays
+   * unreachable the agent quietly keeps its control socket on the default relay.
+   * Neither case changes the displayed route or breaks the tunnel.
+   *
+   * - `premium` with a usable host: show premium, remember the host, and (unless
+   *   in a fallback window) redial through it to accelerate the uplink as well.
+   * - `standard`: the operator withdrew the fast path — show standard, forget
+   *   the host, and return the control socket to the default relay.
+   */
+  private applyRoute(route: unknown, routeHost: unknown): void {
+    if (this.creds === null) return
+    if (route === 'premium' && isValidRouteHost(routeHost)) {
+      this.status.route = 'premium'
+      if (this.creds.routeHost !== routeHost) {
+        this.creds = { ...this.creds, routeHost }
+        this.saveCreds(this.creds)
+      }
+      // Move the uplink onto the premium host too, when it's worth a redial and
+      // not currently being skipped after repeated failures.
+      if (!this.inRouteFallback() && this.dialledHost !== routeHost) this.redial()
+      return
+    }
+    if (route === 'standard' || route === 'premium') {
+      // Standard (or premium the relay could not give a usable host for).
+      this.status.route = 'standard'
+      this.routeFallbackUntil = 0
+      this.routeFails = 0
+      const hadRoute = this.creds.routeHost !== undefined && this.creds.routeHost !== ''
+      if (hadRoute) {
+        this.creds = { ...this.creds, routeHost: undefined }
+        this.saveCreds(this.creds)
+        if (this.dialledHost !== this.effectiveRelayHost()) this.redial()
+      }
+    }
+  }
+
+  /** Drop the live socket and dial again right away (route change). */
+  private redial(): void {
+    if (process.env.DSHN_DEBUG) console.error(`[dshn-agent] route change → redialling via ${this.dialHost()}`)
+    this.backoffMs = 1_000
+    const ws = this.control
+    this.control = null
+    ws?.close()
+    // The closed socket's handler sees it is no longer `this.control` and stays
+    // quiet; this fresh connect owns the reconnect chain from here.
+    this.connect()
+  }
+
   private connect(): void {
     if (this.stopped || this.creds === null) return
     // Never run two control sockets at once. A stale reconnect timer firing while
@@ -534,8 +663,9 @@ export class AgentTunnel {
     // Bare host → wss:// (behind Cloudflare in production); a full ws(s):// URL
     // is honoured as-is so a loopback test can drive a plain-ws relay. The host is
     // the user's self-hosted override when set, else the env/default relay.
-    const relayHost = this.effectiveRelayHost()
+    const relayHost = this.dialHost()
     const base = relayHost.includes('://') ? relayHost : `wss://${relayHost}`
+    this.dialledHost = relayHost
     const wsOpts: Record<string, unknown> = { maxPayload: 512 * 1024 * 1024 }
     // Pin a self-signed relay's cert (as the sole CA) so validation stays strict
     // without a public CA. Also used for a direct off-Cloudflare origin. The PEM
@@ -595,11 +725,30 @@ export class AgentTunnel {
         this.control.terminate()
         return
       }
+      // Assigned premium but the uplink is still on the default relay and the
+      // fallback window has passed: retry the premium host now (the DNS record
+      // has had time to propagate, or the accelerator has recovered).
+      if (this.status.route === 'premium' && this.creds?.routeHost && !this.onPremiumPath() && !this.inRouteFallback()) {
+        this.redial()
+        return
+      }
       this.sendPing()
     }, LATENCY_PING_MS)
   }
 
   private onClose(): void {
+    // A premium-host dial that died before READY counts against that host; after
+    // a few in a row the agent keeps its control socket on the default relay for
+    // a while (the premium DNS record may just be propagating). Browser traffic
+    // is unaffected — it reaches the accelerator by DNS regardless — so this is
+    // silent: the displayed route stays on the operator's assignment.
+    if (!this.status.connected && this.onPremiumPath()) {
+      this.routeFails++
+      if (this.routeFails >= ROUTE_FAIL_MAX) {
+        this.routeFails = 0
+        this.routeFallbackUntil = Date.now() + ROUTE_FALLBACK_MS
+      }
+    }
     this.status.connected = false
     this.connectedSince = null
     this.latencyMs = null
@@ -656,12 +805,19 @@ export class AgentTunnel {
     switch (frame.t) {
       case 'ready':
         this.backoffMs = 1_000
+        this.routeFails = 0
         this.status.connected = true
         this.status.publicUrl = frame.publicUrl
         this.status.subdomain = frame.subdomain
         this.status.lastError = null
         this.connectedSince = Date.now()
         this.sendPing() // measure latency immediately, don't wait a full interval
+        // A route-aware relay says which path this tunnel is on; an older relay
+        // says nothing and the tunnel simply stays where it dialled.
+        if (frame.route !== undefined) this.applyRoute(frame.route, frame.routeHost)
+        break
+      case 'route':
+        this.applyRoute(frame.route, frame.routeHost)
         break
       case 'deny':
         // Wrong password / taken subdomain won't fix itself on retry, but the
@@ -1028,6 +1184,10 @@ export function apply(ctx: any, rawConfig: Partial<AgentConfig> | undefined): vo
         // Connection details for the panel.
         relayHost: info.relayHost,
         mode: info.direct ? 'direct' : 'cloudflare',
+        // Which path the relay assigned: 'premium' (accelerated, via routeHost)
+        // or 'standard'; null until a route-aware relay has said.
+        route: info.route,
+        routeHost: info.routeHost,
         connectedSince: info.connectedSince,
         served: info.served,
         localPort: info.localPort,

@@ -16,6 +16,7 @@ import { randomBytes } from 'node:crypto'
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { ClaimStore } from './claims.js'
+import { CloudflareDns } from './dns.js'
 import { RelayServer, type RelayOptions } from './server.js'
 
 /** Minimal arg parser: `--k v`, `--k=v`, bare `--flag`, and `-h`/`--help`. */
@@ -54,6 +55,16 @@ Options (env var in parens):
   --admin-password <pw>  enable the operator panel at
                       https://<apex>/__admin — platform stats,
                       kick/release/ban claims. Unset = no panel (DSHN_ADMIN_PASSWORD)
+
+Premium route (optional — an accelerator node the operator can move single
+tunnels onto from the admin panel; see SELF-HOSTING.md):
+  --premium-host <ip>    the accelerator's address; enables the feature (DSHN_PREMIUM_HOST)
+  --cf-token <token>     Cloudflare API token (Zone → DNS → Edit) so the relay
+                         manages each premium tunnel's DNS record itself; omit
+                         for manual DNS                            (DSHN_CF_TOKEN)
+  --cf-zone <id>         the Cloudflare zone id of the apex          (DSHN_CF_ZONE)
+  --trusted-proxies <a,b> extra proxy IPs whose X-Forwarded-For is believed
+                         (the premium host itself always is)  (DSHN_TRUSTED_PROXIES)
   -h, --help          show this help
 
 Examples:
@@ -78,6 +89,10 @@ const tlsCert = val('tls-cert', 'DSHN_TLS_CERT') ?? ''
 const tlsKey = val('tls-key', 'DSHN_TLS_KEY') ?? ''
 const sitePath = val('site', 'DSHN_SITE') || undefined
 const adminPassword = val('admin-password', 'DSHN_ADMIN_PASSWORD') || undefined
+const premiumHost = val('premium-host', 'DSHN_PREMIUM_HOST') || undefined
+const cfToken = val('cf-token', 'DSHN_CF_TOKEN') || undefined
+const cfZone = val('cf-zone', 'DSHN_CF_ZONE') || undefined
+const trustedProxies = (val('trusted-proxies', 'DSHN_TRUSTED_PROXIES') ?? '').split(',').map((s) => s.trim()).filter((s) => s !== '')
 
 /**
  * Cookie secret: an explicit --secret / DSHN_COOKIE_SECRET wins; otherwise load a
@@ -110,5 +125,18 @@ if (tlsCert !== '' && tlsKey !== '') {
 mkdirSync(dirname(claimsPath), { recursive: true }) // ensure the claims dir exists before first write
 const claims = ClaimStore.fromFile(claimsPath)
 
-const server = new RelayServer({ apex, port, cookieSecret, claims, tls, sitePath, adminPassword })
-server.listen(() => console.log(`dshn-relay listening on :${port} (${tls ? 'https' : 'http'}) for *.${apex}  [data-dir: ${dataDir}]`))
+let premium: RelayOptions['premium']
+if (premiumHost !== undefined) {
+  if ((cfToken === undefined) !== (cfZone === undefined)) {
+    console.error('dshn-relay: --cf-token and --cf-zone go together (both, or neither for manual DNS)')
+    process.exit(1)
+  }
+  premium = {
+    host: premiumHost,
+    dns: cfToken !== undefined && cfZone !== undefined ? new CloudflareDns(cfToken, cfZone) : undefined,
+    trustedProxies,
+  }
+}
+
+const server = new RelayServer({ apex, port, cookieSecret, claims, tls, sitePath, adminPassword, premium })
+server.listen(() => console.log(`dshn-relay listening on :${port} (${tls ? 'https' : 'http'}) for *.${apex}  [data-dir: ${dataDir}]${premium ? `  [premium route: ${premium.host}, DNS ${premium.dns ? 'managed' : 'manual'}]` : ''}`))

@@ -36,8 +36,11 @@ import {
   type ControlFrame,
   type DataKind,
   type HeaderList,
+  type ReadyFrame,
+  type TunnelRoute,
 } from '@dshn/protocol'
-import { ClaimStore } from './claims.js'
+import { ClaimStore, type PremiumRecord } from './claims.js'
+import type { PremiumDns } from './dns.js'
 import {
   COOKIE_NAME, DEVICE_COOKIE, constantTimeEqual, cookieHeader, deviceCookieHeader, devicesPage, loginPage,
   parseCookies, sign, verify, type PickerDevice,
@@ -75,6 +78,36 @@ export interface RelayOptions {
    * ban). Unset (the default) disables every `/__admin` path with a 404.
    */
   adminPassword?: string
+  /**
+   * The premium route: an accelerator node that terminates TLS for the apex's
+   * wildcard and proxies to this relay. Present = the operator may move
+   * individual claims onto it from the admin panel; absent = the feature does
+   * not exist on this relay (agents are told nothing about routes).
+   */
+  premium?: PremiumOptions
+}
+
+/** Premium-route wiring, all operator-supplied. */
+export interface PremiumOptions {
+  /** The accelerator's address — what the dedicated DNS record points at. */
+  host: string
+  /**
+   * DNS control for the dedicated records. Omit to run the route with manual
+   * DNS: the panel then tells the operator which record to add or remove.
+   */
+  dns?: PremiumDns
+  /**
+   * Peers whose `X-Forwarded-For` is believed for the login rate limit (the
+   * accelerator, which is not Cloudflare and so sends no `cf-connecting-ip`).
+   * `host` is trusted implicitly when it is an IP address.
+   */
+  trustedProxies?: string[]
+  /**
+   * The authority an agent on the premium route dials, per subdomain. Defaults
+   * to the tunnel's own public hostname (`<sub>.<apex>` — which the dedicated
+   * record points at the accelerator); tests override it with a loopback URL.
+   */
+  routeHost?: (subdomain: string) => string
 }
 
 /** Per-subdomain traffic counters — in memory, since the relay started. */
@@ -345,8 +378,36 @@ export class RelayServer {
    * out only the attacker, not the legitimate owner of the subdomain.
    */
   private loginKey(req: http.IncomingMessage, sub: string): string {
-    const ip = String(req.headers['cf-connecting-ip'] ?? req.socket.remoteAddress ?? '?')
-    return `${sub}|${ip}`
+    return `${sub}|${this.clientIp(req)}`
+  }
+
+  /** The peer address of a request, IPv4-mapped forms normalized (`::ffff:1.2.3.4` → `1.2.3.4`). */
+  private peerIp(req: http.IncomingMessage): string {
+    return String(req.socket.remoteAddress ?? '').replace(/^::ffff:/i, '')
+  }
+
+  /** Whether a peer is a proxy whose forwarding headers we believe (the accelerator). */
+  private isTrustedProxy(peer: string): boolean {
+    const p = this.opts.premium
+    if (p === undefined || peer === '') return false
+    if (p.host === peer) return true
+    return (p.trustedProxies ?? []).includes(peer)
+  }
+
+  /**
+   * The real client IP. Behind Cloudflare it is `cf-connecting-ip`. From the
+   * accelerator (a trusted proxy that is NOT Cloudflare) it is the LAST hop of
+   * `X-Forwarded-For` — the one the accelerator itself appended; anything before
+   * it (and any `cf-connecting-ip`) came from the client and is not believed.
+   * Otherwise the socket peer.
+   */
+  private clientIp(req: http.IncomingMessage): string {
+    const peer = this.peerIp(req)
+    if (this.isTrustedProxy(peer)) {
+      const hops = String(req.headers['x-forwarded-for'] ?? '').split(',').map((h) => h.trim()).filter((h) => h !== '')
+      return hops.length > 0 ? hops[hops.length - 1] : peer
+    }
+    return String(req.headers['cf-connecting-ip'] ?? '') || peer || '?'
   }
 
   private handleLogin(req: http.IncomingMessage, res: http.ServerResponse, sub: string): void {
@@ -562,10 +623,118 @@ export class RelayServer {
     if (path === '/__admin/api/state' && req.method === 'GET') return this.serveAdminState(res)
     if (path === '/__admin/api/history' && req.method === 'GET') return this.serveAdminHistory(res)
     if (req.method === 'POST') {
+      if (path === '/__admin/api/premium') return this.handleAdminPremium(req, res)
       const action = { '/__admin/api/kick': 'kick', '/__admin/api/release': 'release', '/__admin/api/ban': 'ban', '/__admin/api/unban': 'unban' }[path]
       if (action !== undefined) return this.handleAdminAction(req, res, action as 'kick' | 'release' | 'ban' | 'unban')
     }
     this.fail(res, 404, 'Not found')
+  }
+
+  // ── premium route ─────────────────────────────────────────────────────────
+
+  /** The public hostname of a subdomain — the name its dedicated DNS record carries. */
+  private hostnameOf(sub: string): string {
+    return `${sub}.${this.opts.apex}`
+  }
+
+  /** What an agent of a premium subdomain should dial. */
+  private routeHostFor(sub: string): string {
+    return this.opts.premium?.routeHost?.(sub) ?? this.hostnameOf(sub)
+  }
+
+  /** The route fields of a READY/ROUTE frame for a subdomain; empty when routes don't exist on this relay. */
+  private routeFields(sub: string): { route?: TunnelRoute; routeHost?: string } {
+    if (this.opts.premium === undefined) return {}
+    const premium = this.opts.claims.premiumOf(sub) !== null
+    return premium ? { route: 'premium', routeHost: this.routeHostFor(sub) } : { route: 'standard' }
+  }
+
+  /** Tell every live agent of a subdomain which route it is on now. */
+  private notifyRoute(sub: string): void {
+    const fields = this.routeFields(sub)
+    if (fields.route === undefined) return
+    for (const conn of this.agents.get(sub)?.values() ?? []) conn.send({ t: 'route', route: fields.route, routeHost: fields.routeHost })
+  }
+
+  /** The admin panel's view of a claim's premium state. */
+  private premiumView(premium: PremiumRecord | null): { since: number; dns: { id: string; content: string } | null } | null {
+    return premium === null ? null : { since: premium.since, dns: premium.dns ?? null }
+  }
+
+  /**
+   * `POST /__admin/api/premium` `{ subdomain, enabled }`: move a claim onto or
+   * off the premium route. With managed DNS the dedicated record is created or
+   * removed FIRST and the claim only changes when that succeeded, so the store
+   * never says "premium" while DNS still says otherwise; a DNS failure leaves
+   * everything as it was and reports why. Live agents are told to re-route.
+   */
+  private handleAdminPremium(req: http.IncomingMessage, res: http.ServerResponse): void {
+    this.readSmallBody(req, (body) => {
+      if (body === null) return
+      let sub: unknown
+      let enabled: unknown
+      try {
+        const parsed = JSON.parse(body) as { subdomain?: unknown; enabled?: unknown }
+        sub = parsed.subdomain
+        enabled = parsed.enabled
+      } catch { sub = undefined }
+      if (typeof sub !== 'string' || sub === '' || sub.length > 64 || typeof enabled !== 'boolean') {
+        return this.json(res, 400, { error: 'expected { subdomain, enabled }' })
+      }
+      void this.setPremiumRoute(sub, enabled).then(
+        (result) => this.json(res, result.status, result.body),
+        (err: unknown) => this.json(res, 500, { error: (err as Error).message }),
+      )
+    })
+  }
+
+  /** The premium toggle proper; see {@link handleAdminPremium}. */
+  private async setPremiumRoute(sub: string, enabled: boolean): Promise<{ status: number; body: unknown }> {
+    const p = this.opts.premium
+    if (p === undefined) return { status: 409, body: { error: 'premium route is not configured on this relay' } }
+    if (!this.opts.claims.isClaimed(sub)) return { status: 404, body: { error: 'no such claim' } }
+    const name = this.hostnameOf(sub)
+    const record = { type: 'A', name, content: p.host, proxied: false }
+    const dnsMode = p.dns === undefined ? 'manual' : 'managed'
+    const current = this.opts.claims.premiumOf(sub)
+    if (enabled) {
+      if (current === null) {
+        let dns: PremiumRecord['dns']
+        if (p.dns !== undefined) {
+          try { dns = await p.dns.point(name, p.host) } catch (err) {
+            return { status: 502, body: { error: `DNS update failed: ${(err as Error).message}` } }
+          }
+        }
+        this.opts.claims.setPremium(sub, { since: Date.now(), ...(dns === undefined ? {} : { dns }) })
+        this.notifyRoute(sub)
+      }
+    } else if (current !== null) {
+      if (p.dns !== undefined) {
+        try { await p.dns.unpoint(name, current.dns?.id, p.host) } catch (err) {
+          return { status: 502, body: { error: `DNS update failed: ${(err as Error).message}` } }
+        }
+      }
+      this.opts.claims.setPremium(sub, null)
+      this.notifyRoute(sub)
+    }
+    return {
+      status: 200,
+      body: { ok: true, subdomain: sub, route: enabled ? 'premium' : 'standard', dns: dnsMode, record, premium: this.premiumView(this.opts.claims.premiumOf(sub)) },
+    }
+  }
+
+  /**
+   * Best-effort removal of a claim's dedicated DNS record when the claim itself
+   * goes away (release / ban): a record left behind would keep pointing a name
+   * nobody holds at the accelerator.
+   */
+  private dropPremiumDns(sub: string): void {
+    const p = this.opts.premium
+    const premium = this.opts.claims.premiumOf(sub)
+    if (p?.dns === undefined || premium === null) return
+    void p.dns.unpoint(this.hostnameOf(sub), premium.dns?.id, p.host).catch((err: unknown) => {
+      console.error(`dshn-relay: cannot remove the premium DNS record of "${sub}": ${(err as Error).message}`)
+    })
   }
 
   /** Admin login POST: same brute-force gate as tunnel logins, keyed under the admin scope. */
@@ -663,6 +832,7 @@ export class RelayServer {
         lastSeen: devs.length > 0 ? devs[0].lastSeen : c.createdAt,
         devices: devs,
         traffic: this.traffic.get(c.subdomain) ?? zero,
+        premium: this.premiumView(c.premium),
       }
     }).sort((a, b) => Number(b.online) - Number(a.online) || b.lastSeen - a.lastSeen)
     this.json(res, 200, {
@@ -680,6 +850,9 @@ export class RelayServer {
       traffic: this.totalTraffic(),
       claims,
       banned: this.opts.claims.listBanned().sort(),
+      premium: this.opts.premium === undefined
+        ? null
+        : { host: this.opts.premium.host, dns: this.opts.premium.dns === undefined ? 'manual' : 'managed', tunnels: claims.filter((c) => c.premium !== null).length },
     })
   }
 
@@ -694,6 +867,7 @@ export class RelayServer {
         case 'kick':
           return this.json(res, 200, { ok: true, kicked: this.kick(sub) })
         case 'release': {
+          this.dropPremiumDns(sub)
           const released = this.opts.claims.remove(sub)
           const kicked = this.kick(sub)
           this.traffic.delete(sub)
@@ -701,6 +875,7 @@ export class RelayServer {
           return this.json(res, 200, { ok: true, released, kicked })
         }
         case 'ban': {
+          this.dropPremiumDns(sub)
           const released = this.opts.claims.ban(sub)
           const kicked = this.kick(sub)
           this.traffic.delete(sub)
@@ -846,7 +1021,8 @@ export class RelayServer {
         if (process.env.DSHN_DEBUG) console.error(`[relay] agent ws "${sub}" ERROR ${err.message}`)
         ws.terminate()
       })
-      ws.send(encodeControl({ t: 'ready', subdomain: sub, publicUrl: `https://${sub}.${this.opts.apex}` }))
+      const ready: ReadyFrame = { t: 'ready', subdomain: sub, publicUrl: `https://${sub}.${this.opts.apex}`, ...this.routeFields(sub) }
+      ws.send(encodeControl(ready))
     })
   }
 

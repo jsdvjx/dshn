@@ -160,3 +160,63 @@ device picker/switcher in the browser when two or more are online. Only a
 reconnect of the SAME device replaces its previous connection. Legacy agents
 that predate device ids all share one slot, so among them the old rule still
 applies: a second one replaces the first.
+
+## Premium route (an accelerator in front of one tunnel)
+
+Some tunnels want a faster path than the default CDN — e.g. a user on a network
+where the CDN's anycast is slow. The **premium route** lets the operator move a
+single claim onto a dedicated accelerator node, from the admin panel, without
+touching anyone else.
+
+How it works: the accelerator terminates TLS for the apex wildcard and reverse-
+proxies to the relay. Enabling premium for `alice` creates one **un-proxied**
+`A alice.<apex> → <accelerator IP>` record that shadows the CDN'd wildcard for
+just that name; the relay also tells `alice`'s agent to dial that same hostname,
+so the uplink takes the fast path too. Disabling removes the record and the name
+falls back to the wildcard. It is **default-off**: every tunnel is standard until
+the operator flips it, and an agent never chooses its own route.
+
+### 1. Point the relay at an accelerator
+
+```sh
+dshn-relay --apex ds.hn --tls-cert … --tls-key … \
+  --admin-password "$ADMIN_PW" \
+  --premium-host 203.0.113.9 \          # the accelerator's public IP
+  --cf-token "$CF_DNS_TOKEN" --cf-zone "$CF_ZONE_ID"   # optional: managed DNS
+```
+
+- `--premium-host` (env `DSHN_PREMIUM_HOST`) turns the feature on and is the IP
+  the dedicated records point at.
+- `--cf-token` + `--cf-zone` (env `DSHN_CF_TOKEN` / `DSHN_CF_ZONE`) let the relay
+  create and remove each premium record itself (a Cloudflare **Zone → DNS → Edit**
+  token, scoped to the apex's zone). Omit them for **manual DNS**: the panel then
+  tells you exactly which record to add or remove.
+- `--trusted-proxies a,b` (env `DSHN_TRUSTED_PROXIES`) — extra proxy IPs whose
+  `X-Forwarded-For` the login rate-limiter believes. The accelerator itself is
+  always trusted; add others only if a further hop sits in front of it.
+
+### 2. Run the accelerator
+
+Any TLS reverse proxy with a wildcard cert for `*.<apex>` works. With Caddy and a
+Cloudflare DNS-01 wildcard:
+
+```
+*.ds.hn {
+  tls { dns cloudflare {env.CF_API_TOKEN} }
+  encode gzip
+  reverse_proxy https://<relay-origin>:8787 {
+    header_up Host {host}
+    transport http { tls_insecure_skip_verify }   # relay uses a self-signed cert
+  }
+}
+```
+
+The accelerator forwards the real client IP as `X-Forwarded-For`; the relay reads
+the last hop from its trusted proxy, so per-IP login lockout still works.
+
+### 3. Flip it in the admin panel
+
+Open `https://<apex>/__admin`, find the claim, and click **Premium**. With managed
+DNS the record appears immediately; with manual DNS a toast tells you what to add.
+The agent's own panel then shows **premium route (accelerated)** on its Link row.
+Clicking **Standard** reverses everything.

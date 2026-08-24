@@ -175,6 +175,11 @@ export function adminPage(apex: string): string {
     margin-right:6px; vertical-align:1px; flex:none; }
   .dot.on { background:var(--good); box-shadow:0 0 0 3px rgba(58,166,117,.18); }
   .state { font-size:12px; color:var(--ink2); white-space:nowrap; }
+  .route { display:inline-flex; align-items:center; gap:4px; font-size:11px; border:1px solid var(--line); border-radius:99px;
+    padding:2px 8px; color:var(--ink3); white-space:nowrap; }
+  .route svg.i { width:11px; height:11px; }
+  .route.on { color:#c9930f; border-color:rgba(201,147,15,.55); background:rgba(201,147,15,.08); }
+  .act .btn.gold:hover { border-color:#c9930f; color:#c9930f; }
   .devs { min-width:200px; max-width:300px; }
   .dev { display:flex; align-items:baseline; font-size:12px; color:var(--ink2); line-height:1.45; }
   .dev .n { overflow-wrap:anywhere; }
@@ -227,7 +232,7 @@ export function adminPage(apex: string): string {
   <h2 id="h-claims">Claims</h2>
   <div class="tablewrap"><table>
     <thead><tr>
-      <th>Subdomain</th><th>Status</th><th>Devices</th><th>Created</th>
+      <th>Subdomain</th><th>Status</th><th>Route</th><th>Devices</th><th>Created</th>
       <th class="num">Requests</th><th class="num">WS</th><th class="num">In</th><th class="num">Out</th><th></th>
     </tr></thead>
     <tbody id="rows"></tbody>
@@ -264,6 +269,8 @@ const I = {
   chart: '<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>',
   list: '<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>',
   globe: '<circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>',
+  route: '<polygon points="3 11 22 2 13 21 11 13 3 11"/>',
+  star: '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>',
 }
 const icon = (n) => '<svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + I[n] + '</svg>'
 $('refresh').innerHTML = icon('refresh') + 'Refresh'
@@ -319,7 +326,9 @@ function tile(ic, k, v, s) {
     + (s ? '<div class="s">' + esc(s) + '</div>' : '') + '</div>'
 }
 
+let lastState = null
 function renderState(st) {
+  lastState = st
   $('apex').textContent = st.apex
   const t = st.totals, tr = st.traffic
   $('tiles').innerHTML = [
@@ -331,6 +340,9 @@ function renderState(st) {
     tile('down', 'Traffic in', fmtBytes(tr.bytesIn), 'since start'),
     tile('up', 'Traffic out', fmtBytes(tr.bytesOut), 'since start'),
     tile('clock', 'Uptime', fmtUptime(st.now - st.startedAt), 'started ' + fmtDate(st.startedAt)),
+    st.premium
+      ? tile('route', 'Premium route', st.premium.tunnels + ' tunnel' + (st.premium.tunnels === 1 ? '' : 's'), st.premium.host + ' · DNS ' + st.premium.dns)
+      : tile('route', 'Premium route', 'off', 'not configured on this relay'),
   ].join('')
 
   const rows = st.claims.map((c) => {
@@ -341,9 +353,16 @@ function renderState(st) {
     const state = c.online
       ? '<span class="state"><span class="dot on"></span>online · ' + c.liveDevices + '</span>'
       : '<span class="state"><span class="dot"></span>offline</span>'
+    const route = c.premium
+      ? '<span class="route on" title="premium since ' + esc(fmtDate(c.premium.since)) + (c.premium.dns ? ' · DNS record ' + esc(c.premium.dns.id) : ' · DNS manual') + '">' + icon('star') + 'premium</span>'
+      : '<span class="route">standard</span>'
+    const routeBtn = !st.premium ? '' : c.premium
+      ? '<button class="btn" data-premium="' + esc(c.subdomain) + '" data-on="0" title="Back to the standard route (via the CDN)">' + icon('route') + 'Standard</button>'
+      : '<button class="btn gold" data-premium="' + esc(c.subdomain) + '" data-on="1" title="Move onto the premium route (' + esc(st.premium.host) + ')">' + icon('star') + 'Premium</button>'
     return '<tr>'
       + '<td class="sub"><a href="https://' + esc(c.subdomain) + '.' + esc(st.apex) + '" target="_blank" rel="noopener">' + esc(c.subdomain) + icon('ext') + '</a></td>'
       + '<td>' + state + '</td>'
+      + '<td>' + route + '</td>'
       + '<td class="devs">' + devs + '</td>'
       + '<td class="dim">' + esc(fmtDate(c.createdAt)) + '</td>'
       + '<td class="num">' + fmtInt(c.traffic.requests) + '</td>'
@@ -351,12 +370,13 @@ function renderState(st) {
       + '<td class="num">' + fmtBytes(c.traffic.bytesIn) + '</td>'
       + '<td class="num">' + fmtBytes(c.traffic.bytesOut) + '</td>'
       + '<td class="act">'
+      + routeBtn
       + (c.online ? '<button class="btn" data-kick="' + esc(c.subdomain) + '" title="Drop live connections">' + icon('power') + 'Kick</button>' : '')
       + '<button class="btn danger" data-release="' + esc(c.subdomain) + '" title="Delete the claim; name becomes free">' + icon('unlock') + 'Release</button>'
       + '<button class="btn danger" data-ban="' + esc(c.subdomain) + '" title="Delete and block the name">' + icon('slash') + 'Ban</button></td>'
       + '</tr>'
   }).join('')
-  $('rows').innerHTML = rows || '<tr><td colspan="9"><div class="empty">No claims yet.</div></td></tr>'
+  $('rows').innerHTML = rows || '<tr><td colspan="10"><div class="empty">No claims yet.</div></td></tr>'
 
   $('bannedwrap').style.display = st.banned.length > 0 ? '' : 'none'
   $('banned').innerHTML = st.banned.map((s) =>
@@ -535,11 +555,11 @@ let resizeTimer
 window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderCharts, 150) })
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', renderCharts)
 
-async function act(path, subdomain) {
+async function act(path, subdomain, extra) {
   const res = await fetch(path, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ subdomain }),
+    body: JSON.stringify(Object.assign({ subdomain }, extra || {})),
   })
   if (res.status === 401) { location.reload(); return null }
   return res.json().catch(() => null)
@@ -547,8 +567,22 @@ async function act(path, subdomain) {
 
 document.addEventListener('click', async (e) => {
   const b = e.target.closest('button'); if (!b) return
-  const kick = b.dataset.kick, release = b.dataset.release, ban = b.dataset.ban, unban = b.dataset.unban
-  if (kick) {
+  const kick = b.dataset.kick, release = b.dataset.release, ban = b.dataset.ban, unban = b.dataset.unban, premium = b.dataset.premium
+  if (premium) {
+    const on = b.dataset.on === '1'
+    const host = lastState && lastState.premium ? lastState.premium.host : '?'
+    const msg = on
+      ? 'Move "' + premium + '" onto the premium route?\n\nA dedicated DNS record points ' + premium + '.' + lastState.apex + ' at ' + host + ' (DNS only, bypassing the CDN); its agent is told to reconnect through that path. Visitors follow within the DNS TTL.'
+      : 'Move "' + premium + '" back to the standard route?\n\nIts dedicated DNS record is removed (the CDN wildcard takes over again) and its agent reconnects through the default relay host.'
+    if (!confirm(msg)) return
+    const r = await act('/__admin/api/premium', premium, { enabled: on })
+    if (r) {
+      if (!r.ok) toast('Route change failed: ' + (r.error || '?'))
+      else if (r.dns === 'manual') toast((on ? 'Premium route set — now ADD DNS: ' : 'Standard route set — now REMOVE DNS: ') + r.record.type + ' ' + r.record.name + ' → ' + r.record.content + ' (DNS only)')
+      else toast((on ? 'Premium route enabled for ' : 'Back to standard route: ') + premium)
+    }
+    loadState()
+  } else if (kick) {
     if (!confirm('Kick every live device of "' + kick + '" offline? Their agents will auto-reconnect unless stopped.')) return
     const r = await act('/__admin/api/kick', kick)
     if (r) toast(r.ok ? 'Kicked ' + r.kicked + ' device(s) of ' + kick : 'Kick failed: ' + (r.error || '?'))
