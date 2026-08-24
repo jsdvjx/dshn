@@ -16,11 +16,13 @@ const MAX_AGE_S = 30 * 24 * 3600
 /**
  * Mint a signed session value binding a subdomain to an expiry.
  * @param secret - the relay's cookie-signing secret.
- * @param subdomain - the subdomain the session is valid for.
+ * @param subdomain - the subdomain the session is valid for (or an admin scope —
+ *   any string that can never be a claimable label works as a namespace).
+ * @param maxAgeS - session lifetime in seconds; defaults to the tunnel session's.
  * @returns the cookie value `exp.mac`.
  */
-export function sign(secret: string, subdomain: string): string {
-  const exp = Math.floor(Date.now() / 1000) + MAX_AGE_S
+export function sign(secret: string, subdomain: string, maxAgeS: number = MAX_AGE_S): string {
+  const exp = Math.floor(Date.now() / 1000) + maxAgeS
   const mac = createHmac('sha256', secret).update(`${subdomain}.${exp}`).digest('base64url')
   return `${exp}.${mac}`
 }

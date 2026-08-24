@@ -132,12 +132,25 @@ Run `npx @dshn/relay --help` for the live list.
 | `--claims` | `DSHN_CLAIMS` | `<data-dir>/claims.json` | JSON file the relay creates/maintains: subdomain → scrypt hash |
 | `--tls-cert` / `--tls-key` | `DSHN_TLS_CERT` / `DSHN_TLS_KEY` | — | PEM paths to serve HTTPS directly (omit to serve plain HTTP behind a TLS-terminating proxy) |
 | `--site` | `DSHN_SITE` | — | optional landing-page `index.html` for the bare apex (flat sibling `.html`/`.css`/… served too) |
+| `--admin-password` | `DSHN_ADMIN_PASSWORD` | — | enable the operator admin panel at `https://<apex>/__admin` (unset = no panel, all its paths 404) |
 | — | `DSHN_DEBUG` | — | set to log connection lifecycle to stderr |
 
 You don't have to set a cookie secret: on first run the relay generates a strong
 random one and saves it to `<data-dir>/cookie-secret` (`chmod 600`), reusing it on
 restart so sessions survive. **Back up your `--data-dir`** — `claims.json` is the
 only record of who owns which subdomain, and deleting the secret logs everyone out.
+
+## Admin panel
+
+Set `--admin-password` (or `DSHN_ADMIN_PASSWORD`) and the bare apex serves an
+operator dashboard at `/__admin`: platform totals (claims, live devices,
+per-subdomain traffic since the relay started) and per-claim management —
+**Kick** (drop the live connections; agents may reconnect), **Release** (delete
+the claim so the name is free to claim again — note an auto-reconnecting agent
+can immediately re-claim it), and **Ban** (kick + delete + block the label from
+being claimed until unbanned; bans persist in `claims.json`). Sessions last 12
+hours; wrong guesses hit the same per-IP lockout as tunnel logins. Without a
+configured password the panel does not exist: every `/__admin` path is a 404.
 
 ## Devices per subdomain
 

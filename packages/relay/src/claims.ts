@@ -64,9 +64,12 @@ function hexEqual(a: string, b: string): boolean {
 
 export class ClaimStore {
   private readonly claims = new Map<string, ClaimRecord>()
+  /** Subdomains an admin has banned: never claimable until unbanned. */
+  private readonly banned = new Set<string>()
 
-  constructor(private readonly path: string, seed?: Record<string, ClaimRecord>) {
+  constructor(private readonly path: string, seed?: Record<string, ClaimRecord>, banned?: string[]) {
     if (seed !== undefined) for (const [k, v] of Object.entries(seed)) this.claims.set(k, v)
+    if (banned !== undefined) for (const b of banned) this.banned.add(b)
   }
 
   /**
@@ -76,8 +79,8 @@ export class ClaimStore {
    */
   static fromFile(path: string): ClaimStore {
     try {
-      const raw = JSON.parse(readFileSync(path, 'utf8')) as { claims?: Record<string, ClaimRecord> }
-      return new ClaimStore(path, raw.claims ?? {})
+      const raw = JSON.parse(readFileSync(path, 'utf8')) as { claims?: Record<string, ClaimRecord>; banned?: string[] }
+      return new ClaimStore(path, raw.claims ?? {}, raw.banned ?? [])
     } catch {
       // Absent or unreadable → a fresh store; first claim will create the file.
       return new ClaimStore(path)
@@ -93,7 +96,7 @@ export class ClaimStore {
    */
   private persist(): void {
     try {
-      const body = JSON.stringify({ claims: Object.fromEntries(this.claims) })
+      const body = JSON.stringify({ claims: Object.fromEntries(this.claims), banned: [...this.banned] })
       const tmp = `${this.path}.tmp`
       writeFileSync(tmp, body, { mode: 0o600 })
       renameSync(tmp, this.path)
@@ -112,6 +115,7 @@ export class ClaimStore {
    */
   claimOrVerify(subdomain: string, password: string, now: number): ClaimResult {
     if (!isValidSubdomainLabel(subdomain)) return { ok: false, claimed: false, reason: 'invalid or reserved subdomain' }
+    if (this.banned.has(subdomain)) return { ok: false, claimed: false, reason: 'subdomain is banned' }
     if (password.length < 8) return { ok: false, claimed: false, reason: 'password too short (min 8)' }
     const existing = this.claims.get(subdomain)
     if (existing === undefined) {
@@ -169,5 +173,56 @@ export class ClaimStore {
   devicesOf(subdomain: string): Array<{ id: string } & DeviceRecord> {
     const devices = this.claims.get(subdomain)?.devices ?? {}
     return Object.entries(devices).map(([id, d]) => ({ id, name: d.name, lastSeen: d.lastSeen }))
+  }
+
+  /** Every claim, without password material — for the admin panel. */
+  list(): Array<{ subdomain: string; createdAt: number; devices: Array<{ id: string } & DeviceRecord> }> {
+    return [...this.claims.entries()].map(([subdomain, c]) => ({
+      subdomain,
+      createdAt: c.createdAt,
+      devices: Object.entries(c.devices ?? {}).map(([id, d]) => ({ id, name: d.name, lastSeen: d.lastSeen })),
+    }))
+  }
+
+  /**
+   * Release a claim: the subdomain becomes free to claim again with a new
+   * password. Admin-only — there is deliberately no self-service path to this.
+   * @param subdomain - the claimed label to release.
+   * @returns whether a claim existed and was removed.
+   */
+  remove(subdomain: string): boolean {
+    const existed = this.claims.delete(subdomain)
+    if (existed) this.persist()
+    return existed
+  }
+
+  /**
+   * Ban a subdomain: its claim (if any) is deleted and no agent may claim the
+   * label again until it is unbanned. Note this bans the *name*, not the person
+   * — the relay knows users only as claims. Admin-only.
+   * @param subdomain - the label to ban.
+   * @returns whether a live claim was deleted in the process.
+   */
+  ban(subdomain: string): boolean {
+    const existed = this.claims.delete(subdomain)
+    this.banned.add(subdomain)
+    this.persist()
+    return existed
+  }
+
+  /**
+   * Lift a ban; the label becomes claimable again (by anyone).
+   * @param subdomain - the banned label.
+   * @returns whether it was banned.
+   */
+  unban(subdomain: string): boolean {
+    const existed = this.banned.delete(subdomain)
+    if (existed) this.persist()
+    return existed
+  }
+
+  /** The banned labels, for the admin panel. */
+  listBanned(): string[] {
+    return [...this.banned]
   }
 }

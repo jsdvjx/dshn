@@ -1,6 +1,6 @@
 {
   "name": "dshn",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "DeepSeek Harness Network — public-internet forwarding for a local dsh web service, over ds.hn: a dsh plugin (local agent) + a WSS relay behind Cloudflare.",

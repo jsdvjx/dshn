@@ -51,6 +51,9 @@ Options (env var in parens):
   --tls-cert <file>   PEM cert to serve HTTPS directly        (DSHN_TLS_CERT)
   --tls-key <file>    PEM key to serve HTTPS directly         (DSHN_TLS_KEY)
   --site <file>       index.html to serve on the bare apex    (DSHN_SITE)
+  --admin-password <pw>  enable the operator panel at
+                      https://<apex>/__admin — platform stats,
+                      kick/release/ban claims. Unset = no panel (DSHN_ADMIN_PASSWORD)
   -h, --help          show this help
 
 Examples:
@@ -74,6 +77,7 @@ const claimsPath = val('claims', 'DSHN_CLAIMS') ?? join(dataDir, 'claims.json')
 const tlsCert = val('tls-cert', 'DSHN_TLS_CERT') ?? ''
 const tlsKey = val('tls-key', 'DSHN_TLS_KEY') ?? ''
 const sitePath = val('site', 'DSHN_SITE') || undefined
+const adminPassword = val('admin-password', 'DSHN_ADMIN_PASSWORD') || undefined
 
 /**
  * Cookie secret: an explicit --secret / DSHN_COOKIE_SECRET wins; otherwise load a
@@ -106,5 +110,5 @@ if (tlsCert !== '' && tlsKey !== '') {
 mkdirSync(dirname(claimsPath), { recursive: true }) // ensure the claims dir exists before first write
 const claims = ClaimStore.fromFile(claimsPath)
 
-const server = new RelayServer({ apex, port, cookieSecret, claims, tls, sitePath })
+const server = new RelayServer({ apex, port, cookieSecret, claims, tls, sitePath, adminPassword })
 server.listen(() => console.log(`dshn-relay listening on :${port} (${tls ? 'https' : 'http'}) for *.${apex}  [data-dir: ${dataDir}]`))

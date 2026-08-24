@@ -39,9 +39,12 @@ import {
 } from '@dshn/protocol'
 import { ClaimStore } from './claims.js'
 import {
-  COOKIE_NAME, DEVICE_COOKIE, cookieHeader, deviceCookieHeader, devicesPage, loginPage,
+  COOKIE_NAME, DEVICE_COOKIE, constantTimeEqual, cookieHeader, deviceCookieHeader, devicesPage, loginPage,
   parseCookies, sign, verify, type PickerDevice,
 } from './auth.js'
+import {
+  ADMIN_COOKIE, ADMIN_MAX_AGE_S, ADMIN_SCOPE, adminCookieHeader, adminLoginPage, adminPage,
+} from './admin.js'
 
 /** Relay construction options, all operator-supplied via the entry point. */
 export interface RelayOptions {
@@ -66,6 +69,24 @@ export interface RelayOptions {
    * answering the apex with 421 as before.
    */
   sitePath?: string
+  /**
+   * Admin panel password. When set, `/__admin` on the bare apex serves the
+   * operator dashboard: platform stats plus claim management (kick, release,
+   * ban). Unset (the default) disables every `/__admin` path with a 404.
+   */
+  adminPassword?: string
+}
+
+/** Per-subdomain traffic counters — in memory, since the relay started. */
+interface Traffic {
+  /** Public HTTP requests routed to an agent. */
+  requests: number
+  /** Browser WebSocket sessions bridged to an agent. */
+  wsSessions: number
+  /** Body/message bytes from the public side to the agent. */
+  bytesIn: number
+  /** Body/message bytes from the agent to the public side. */
+  bytesOut: number
 }
 
 /** Content types for the flat asset extensions the apex site may serve. */
@@ -190,6 +211,10 @@ export class RelayServer {
   /** Per-subdomain login failure tracking for the brute-force lockout. */
   private readonly loginGate = new Map<string, { count: number; last: number; until: number }>()
   private heartbeat: ReturnType<typeof setInterval> | null = null
+  /** When this relay process started, for the admin panel's uptime. */
+  private readonly startedAt = Date.now()
+  /** Per-subdomain traffic counters since start (admin panel; bounded by claims). */
+  private readonly traffic = new Map<string, Traffic>()
 
   constructor(private readonly opts: RelayOptions) {
     const handler = (req: http.IncomingMessage, res: http.ServerResponse) => this.onRequest(req, res)
@@ -252,7 +277,11 @@ export class RelayServer {
       res.end()
       return
     }
-    if (bare === this.opts.apex && this.opts.sitePath !== undefined) return this.serveSite(req, res)
+    if (bare === this.opts.apex) {
+      const apexPath = (req.url ?? '/').split('?', 1)[0]
+      if (apexPath === '/__admin' || apexPath.startsWith('/__admin/')) return this.handleAdmin(req, res, apexPath)
+      if (this.opts.sitePath !== undefined) return this.serveSite(req, res)
+    }
 
     const sub = subdomainOf(req.headers.host ?? '', this.opts.apex)
     if (sub === null) return this.fail(res, 421, 'Unknown host')
@@ -277,9 +306,11 @@ export class RelayServer {
     const conn = route.conn
 
     const id = conn.allocId()
+    const traffic = this.trafficOf(sub)
+    traffic.requests++
     conn.responses.set(id, res)
     conn.send({ t: 'req_head', id, method: req.method ?? 'GET', path: url, headers: headerList(req.rawHeaders) })
-    req.on('data', (chunk: Buffer) => conn.sendData(DATA_REQ_BODY, id, chunk))
+    req.on('data', (chunk: Buffer) => { traffic.bytesIn += chunk.length; conn.sendData(DATA_REQ_BODY, id, chunk) })
     req.on('end', () => conn.send({ t: 'req_end', id }))
     req.on('error', () => conn.send({ t: 'abort', id, reason: 'request stream error' }))
     res.on('close', () => {
@@ -455,6 +486,199 @@ export class RelayServer {
     })
   }
 
+  // ── admin panel (bare apex, /__admin, only when a password is configured) ──
+
+  /** The traffic counter of a subdomain, created on first touch. */
+  private trafficOf(sub: string): Traffic {
+    let t = this.traffic.get(sub)
+    if (t === undefined) {
+      t = { requests: 0, wsSessions: 0, bytesIn: 0, bytesOut: 0 }
+      this.traffic.set(sub, t)
+    }
+    return t
+  }
+
+  /** Read a small request body under the same cap as the login gate; null = over cap. */
+  private readSmallBody(req: http.IncomingMessage, cb: (body: string | null) => void): void {
+    let body = ''
+    let over = false
+    req.on('data', (chunk: Buffer) => {
+      body += chunk.toString('utf8')
+      if (body.length > MAX_LOGIN_BODY) { over = true; req.destroy() }
+    })
+    req.on('end', () => { if (!over) cb(body) })
+  }
+
+  /** Answer a JSON admin API response. */
+  private json(res: http.ServerResponse, status: number, payload: unknown): void {
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end(JSON.stringify(payload))
+  }
+
+  /**
+   * Route an apex `/__admin*` request. With no admin password configured every
+   * path is a 404 — the panel is invisible, not merely locked. The dashboard
+   * page doubles as the login page when the session cookie is absent/expired;
+   * everything else requires the session.
+   */
+  private handleAdmin(req: http.IncomingMessage, res: http.ServerResponse, path: string): void {
+    const pw = this.opts.adminPassword ?? ''
+    if (pw === '') return this.fail(res, 404, 'Not found')
+    if (path === '/__admin/login' && req.method === 'POST') return this.handleAdminLogin(req, res, pw)
+    const authed = verify(this.opts.cookieSecret, ADMIN_SCOPE, parseCookies(req.headers.cookie)[ADMIN_COOKIE] ?? '')
+    if (path === '/__admin' || path === '/__admin/') {
+      if (req.method !== 'GET' && req.method !== 'HEAD') return this.fail(res, 405, 'Method not allowed')
+      const html = authed ? adminPage(this.opts.apex) : adminLoginPage(this.opts.apex, false)
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+      res.end(req.method === 'HEAD' ? undefined : html)
+      return
+    }
+    if (!authed) return this.fail(res, 401, 'Unauthorized')
+    if (path === '/__admin/logout' && req.method === 'POST') {
+      res.writeHead(302, { 'set-cookie': adminCookieHeader(null), location: '/__admin' })
+      res.end()
+      return
+    }
+    if (path === '/__admin/api/state' && req.method === 'GET') return this.serveAdminState(res)
+    if (req.method === 'POST') {
+      const action = { '/__admin/api/kick': 'kick', '/__admin/api/release': 'release', '/__admin/api/ban': 'ban', '/__admin/api/unban': 'unban' }[path]
+      if (action !== undefined) return this.handleAdminAction(req, res, action as 'kick' | 'release' | 'ban' | 'unban')
+    }
+    this.fail(res, 404, 'Not found')
+  }
+
+  /** Admin login POST: same brute-force gate as tunnel logins, keyed under the admin scope. */
+  private handleAdminLogin(req: http.IncomingMessage, res: http.ServerResponse, pw: string): void {
+    const now = Date.now()
+    const key = this.loginKey(req, ADMIN_SCOPE)
+    const gate = this.loginGate.get(key)
+    if (gate !== undefined && gate.until > now) {
+      const secs = Math.ceil((gate.until - now) / 1000)
+      res.writeHead(429, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': String(secs), 'cache-control': 'no-store' })
+      res.end(`Too many attempts. Try again in ${secs}s.\n`)
+      return
+    }
+    this.readSmallBody(req, (body) => {
+      if (body === null) return
+      const password = new URLSearchParams(body).get('password') ?? ''
+      if (password !== '' && constantTimeEqual(password, pw)) {
+        this.loginGate.delete(key)
+        res.writeHead(302, {
+          'set-cookie': adminCookieHeader(sign(this.opts.cookieSecret, ADMIN_SCOPE, ADMIN_MAX_AGE_S)),
+          location: '/__admin',
+        })
+        res.end()
+      } else {
+        this.registerLoginFailure(key, now)
+        res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+        res.end(adminLoginPage(this.opts.apex, true))
+      }
+    })
+  }
+
+  /** `GET /__admin/api/state`: everything the dashboard renders, in one shot. */
+  private serveAdminState(res: http.ServerResponse): void {
+    const now = Date.now()
+    let onlineDevices = 0
+    let inflightRequests = 0
+    let inflightSockets = 0
+    for (const group of this.agents.values()) {
+      for (const conn of group.values()) {
+        onlineDevices++
+        inflightRequests += conn.responses.size
+        inflightSockets += conn.sockets.size
+      }
+    }
+    const zero: Traffic = { requests: 0, wsSessions: 0, bytesIn: 0, bytesOut: 0 }
+    let knownDevices = 0
+    const claims = this.opts.claims.list().map((c) => {
+      const group = this.agents.get(c.subdomain)
+      // Merge remembered devices with live connections (live identity wins).
+      const devices = new Map<string, { id: string; name: string; lastSeen: number; online: boolean }>()
+      for (const d of c.devices) devices.set(d.id, { id: d.id, name: d.name, lastSeen: d.lastSeen, online: false })
+      for (const [id, conn] of group ?? []) devices.set(id, { id, name: conn.deviceName, lastSeen: conn.connectedAt, online: true })
+      const devs = [...devices.values()].sort((a, b) => Number(b.online) - Number(a.online) || b.lastSeen - a.lastSeen)
+      knownDevices += devs.length
+      return {
+        subdomain: c.subdomain,
+        createdAt: c.createdAt,
+        online: (group?.size ?? 0) > 0,
+        liveDevices: group?.size ?? 0,
+        lastSeen: devs.length > 0 ? devs[0].lastSeen : c.createdAt,
+        devices: devs,
+        traffic: this.traffic.get(c.subdomain) ?? zero,
+      }
+    }).sort((a, b) => Number(b.online) - Number(a.online) || b.lastSeen - a.lastSeen)
+    const total: Traffic = { requests: 0, wsSessions: 0, bytesIn: 0, bytesOut: 0 }
+    for (const t of this.traffic.values()) {
+      total.requests += t.requests
+      total.wsSessions += t.wsSessions
+      total.bytesIn += t.bytesIn
+      total.bytesOut += t.bytesOut
+    }
+    this.json(res, 200, {
+      now,
+      startedAt: this.startedAt,
+      apex: this.opts.apex,
+      totals: {
+        claims: claims.length,
+        onlineSubdomains: this.agents.size,
+        onlineDevices,
+        knownDevices,
+        inflightRequests,
+        inflightSockets,
+      },
+      traffic: total,
+      claims,
+      banned: this.opts.claims.listBanned().sort(),
+    })
+  }
+
+  /** Admin actions on one subdomain: kick its agents, release its claim, ban, unban. */
+  private handleAdminAction(req: http.IncomingMessage, res: http.ServerResponse, action: 'kick' | 'release' | 'ban' | 'unban'): void {
+    this.readSmallBody(req, (body) => {
+      if (body === null) return
+      let sub: unknown
+      try { sub = (JSON.parse(body) as { subdomain?: unknown }).subdomain } catch { sub = undefined }
+      if (typeof sub !== 'string' || sub === '' || sub.length > 64) return this.json(res, 400, { error: 'missing subdomain' })
+      switch (action) {
+        case 'kick':
+          return this.json(res, 200, { ok: true, kicked: this.kick(sub) })
+        case 'release': {
+          const released = this.opts.claims.remove(sub)
+          const kicked = this.kick(sub)
+          this.traffic.delete(sub)
+          if (!released && kicked === 0) return this.json(res, 404, { error: 'no such claim' })
+          return this.json(res, 200, { ok: true, released, kicked })
+        }
+        case 'ban': {
+          const released = this.opts.claims.ban(sub)
+          const kicked = this.kick(sub)
+          this.traffic.delete(sub)
+          return this.json(res, 200, { ok: true, released, kicked })
+        }
+        case 'unban': {
+          if (!this.opts.claims.unban(sub)) return this.json(res, 404, { error: 'not banned' })
+          return this.json(res, 200, { ok: true })
+        }
+      }
+    })
+  }
+
+  /**
+   * Terminate every live agent of a subdomain. The agents will try to
+   * reconnect; whether they get back in is the claim store's call (a released
+   * name re-claims, a banned one is denied).
+   * @returns how many connections were dropped.
+   */
+  private kick(sub: string): number {
+    const group = this.agents.get(sub)
+    if (group === undefined) return 0
+    const n = group.size
+    for (const conn of group.values()) conn.ws.terminate()
+    return n
+  }
+
   /** Cached apex site files, keyed by filename, invalidated by mtime. */
   private readonly site = new Map<string, { mtimeMs: number; body: Buffer }>()
 
@@ -591,8 +815,10 @@ export class RelayServer {
     if (isBinary) {
       const frame = decodeData(toBuf(data))
       if (frame.kind === DATA_RES_BODY) {
+        this.trafficOf(conn.subdomain).bytesOut += frame.payload.length
         conn.responses.get(frame.id)?.write(Buffer.from(frame.payload))
       } else if (frame.kind === DATA_WS_TEXT || frame.kind === DATA_WS_BINARY) {
+        this.trafficOf(conn.subdomain).bytesOut += frame.payload.length
         conn.sockets.get(frame.id)?.send(Buffer.from(frame.payload), { binary: frame.kind === DATA_WS_BINARY })
       }
       return
@@ -640,10 +866,14 @@ export class RelayServer {
 
   private bridgeSocket(conn: AgentConnection, browser: WebSocket, req: http.IncomingMessage): void {
     const id = conn.allocId()
+    const traffic = this.trafficOf(conn.subdomain)
+    traffic.wsSessions++
     conn.sockets.set(id, browser)
     conn.send({ t: 'ws_open', id, path: req.url ?? '/', headers: headerList(req.rawHeaders) })
     browser.on('message', (data: RawData, isBinary: boolean) => {
-      conn.sendData(isBinary ? DATA_WS_BINARY : DATA_WS_TEXT, id, toBuf(data))
+      const buf = toBuf(data)
+      traffic.bytesIn += buf.length
+      conn.sendData(isBinary ? DATA_WS_BINARY : DATA_WS_TEXT, id, buf)
     })
     browser.on('close', (code: number, reason: Buffer) => {
       if (conn.sockets.delete(id)) conn.send({ t: 'ws_close', id, code: sanitizeCloseCode(code), reason: sanitizeCloseReason(reason.toString('utf8')) })
