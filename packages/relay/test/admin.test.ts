@@ -281,6 +281,19 @@ describe('admin panel', () => {
     expect(reloaded.claimOrVerify('gone', 'some-password', Date.now()).ok).toBe(true)
   })
 
+  it('serves trend history: a sample taken at start, cumulative columns', async () => {
+    const res = await request(port, APEX, '/__admin/api/history', { cookie: admin })
+    expect(res.status).toBe(200)
+    const h = JSON.parse(res.body)
+    expect(h.interval).toBeGreaterThan(0)
+    expect(h.columns).toEqual(['t', 'requests', 'wsSessions', 'bytesIn', 'bytesOut', 'onlineDevices', 'onlineSubdomains'])
+    expect(h.samples.length).toBeGreaterThanOrEqual(1)
+    const first = h.samples[0]
+    expect(first).toHaveLength(7)
+    expect(first[0]).toBeGreaterThan(0)
+    expect((await request(port, APEX, '/__admin/api/history')).status).toBe(401)
+  })
+
   it('rejects admin API calls without a session and logs out cleanly', async () => {
     const unauth = await request(port, APEX, '/__admin/api/kick', {
       method: 'POST', contentType: 'application/json', body: JSON.stringify({ subdomain: 'alpha' }),

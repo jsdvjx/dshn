@@ -102,6 +102,14 @@ const SITE_TYPES: Record<string, string> = {
 /** Largest login POST body accepted, so the gate can't be used to buffer memory. */
 const MAX_LOGIN_BODY = 4096
 
+/**
+ * Admin history sampling: one snapshot of the platform counters every
+ * HISTORY_INTERVAL_MS, kept for HISTORY_MAX samples (24h at 30s). In memory
+ * only — it is a dashboard trend line, not an audit log.
+ */
+const HISTORY_INTERVAL_MS = 30_000
+const HISTORY_MAX = 2880
+
 /** Login brute-force gate: N wrong guesses within the window → lock out. */
 const LOGIN_FAIL_MAX = 8
 const LOGIN_FAIL_WINDOW_MS = 15 * 60 * 1000
@@ -215,6 +223,13 @@ export class RelayServer {
   private readonly startedAt = Date.now()
   /** Per-subdomain traffic counters since start (admin panel; bounded by claims). */
   private readonly traffic = new Map<string, Traffic>()
+  /**
+   * Admin trend samples, oldest first. Each row is
+   * `[t, requests, wsSessions, bytesIn, bytesOut, onlineDevices, onlineSubdomains]`
+   * with the counters cumulative — the dashboard diffs neighbours for rates.
+   */
+  private readonly history: number[][] = []
+  private sampler: ReturnType<typeof setInterval> | null = null
 
   constructor(private readonly opts: RelayOptions) {
     const handler = (req: http.IncomingMessage, res: http.ServerResponse) => this.onRequest(req, res)
@@ -232,6 +247,10 @@ export class RelayServer {
   listen(cb?: () => void): void {
     this.http.listen(this.opts.port, cb)
     this.heartbeat = setInterval(() => this.sweep(), HEARTBEAT_INTERVAL_MS)
+    if (this.opts.adminPassword) {
+      this.sample()
+      this.sampler = setInterval(() => this.sample(), HISTORY_INTERVAL_MS)
+    }
   }
 
   /** The actually bound port (differs from the option when it was 0). */
@@ -243,6 +262,7 @@ export class RelayServer {
   /** Shut down: drop every agent socket and stop listening (tests, embedding). */
   close(): void {
     if (this.heartbeat !== null) { clearInterval(this.heartbeat); this.heartbeat = null }
+    if (this.sampler !== null) { clearInterval(this.sampler); this.sampler = null }
     for (const group of this.agents.values()) for (const conn of group.values()) conn.ws.terminate()
     this.wss.close()
     this.http.close()
@@ -540,6 +560,7 @@ export class RelayServer {
       return
     }
     if (path === '/__admin/api/state' && req.method === 'GET') return this.serveAdminState(res)
+    if (path === '/__admin/api/history' && req.method === 'GET') return this.serveAdminHistory(res)
     if (req.method === 'POST') {
       const action = { '/__admin/api/kick': 'kick', '/__admin/api/release': 'release', '/__admin/api/ban': 'ban', '/__admin/api/unban': 'unban' }[path]
       if (action !== undefined) return this.handleAdminAction(req, res, action as 'kick' | 'release' | 'ban' | 'unban')
@@ -576,9 +597,8 @@ export class RelayServer {
     })
   }
 
-  /** `GET /__admin/api/state`: everything the dashboard renders, in one shot. */
-  private serveAdminState(res: http.ServerResponse): void {
-    const now = Date.now()
+  /** Live connection totals across every subdomain. */
+  private liveCounts(): { onlineDevices: number; inflightRequests: number; inflightSockets: number } {
     let onlineDevices = 0
     let inflightRequests = 0
     let inflightSockets = 0
@@ -589,6 +609,42 @@ export class RelayServer {
         inflightSockets += conn.sockets.size
       }
     }
+    return { onlineDevices, inflightRequests, inflightSockets }
+  }
+
+  /** Platform-wide traffic counters, summed over every subdomain. */
+  private totalTraffic(): Traffic {
+    const total: Traffic = { requests: 0, wsSessions: 0, bytesIn: 0, bytesOut: 0 }
+    for (const t of this.traffic.values()) {
+      total.requests += t.requests
+      total.wsSessions += t.wsSessions
+      total.bytesIn += t.bytesIn
+      total.bytesOut += t.bytesOut
+    }
+    return total
+  }
+
+  /** Append one history row (see {@link history} for the layout), bounded. */
+  private sample(): void {
+    const t = this.totalTraffic()
+    const live = this.liveCounts()
+    this.history.push([Date.now(), t.requests, t.wsSessions, t.bytesIn, t.bytesOut, live.onlineDevices, this.agents.size])
+    if (this.history.length > HISTORY_MAX) this.history.splice(0, this.history.length - HISTORY_MAX)
+  }
+
+  /** `GET /__admin/api/history`: the trend samples for the dashboard charts. */
+  private serveAdminHistory(res: http.ServerResponse): void {
+    this.json(res, 200, {
+      interval: HISTORY_INTERVAL_MS,
+      columns: ['t', 'requests', 'wsSessions', 'bytesIn', 'bytesOut', 'onlineDevices', 'onlineSubdomains'],
+      samples: this.history,
+    })
+  }
+
+  /** `GET /__admin/api/state`: everything the dashboard renders, in one shot. */
+  private serveAdminState(res: http.ServerResponse): void {
+    const now = Date.now()
+    const { onlineDevices, inflightRequests, inflightSockets } = this.liveCounts()
     const zero: Traffic = { requests: 0, wsSessions: 0, bytesIn: 0, bytesOut: 0 }
     let knownDevices = 0
     const claims = this.opts.claims.list().map((c) => {
@@ -609,13 +665,6 @@ export class RelayServer {
         traffic: this.traffic.get(c.subdomain) ?? zero,
       }
     }).sort((a, b) => Number(b.online) - Number(a.online) || b.lastSeen - a.lastSeen)
-    const total: Traffic = { requests: 0, wsSessions: 0, bytesIn: 0, bytesOut: 0 }
-    for (const t of this.traffic.values()) {
-      total.requests += t.requests
-      total.wsSessions += t.wsSessions
-      total.bytesIn += t.bytesIn
-      total.bytesOut += t.bytesOut
-    }
     this.json(res, 200, {
       now,
       startedAt: this.startedAt,
@@ -628,7 +677,7 @@ export class RelayServer {
         inflightRequests,
         inflightSockets,
       },
-      traffic: total,
+      traffic: this.totalTraffic(),
       claims,
       banned: this.opts.claims.listBanned().sort(),
     })

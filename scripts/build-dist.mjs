@@ -74,7 +74,7 @@ copyFileSync('SELF-HOSTING.md', 'dist/relay/README.md')
 copyFileSync('LICENSE', 'dist/relay/LICENSE')
 writeFileSync('dist/relay/package.json', JSON.stringify({
   name: '@dshn/relay',
-  version: '0.3.0',
+  version: '0.3.1',
   description: 'Self-hostable ds.hn-style relay: a login-gated *.<apex> tunnel router that bridges public requests to dshn agents.',
   keywords: ['dsh', 'deepseek-harness', 'tunnel', 'relay', 'self-hosted', 'reverse-tunnel', 'ds.hn'],
   license: 'MIT',
