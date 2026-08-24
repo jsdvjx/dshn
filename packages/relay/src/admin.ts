@@ -572,8 +572,8 @@ document.addEventListener('click', async (e) => {
     const on = b.dataset.on === '1'
     const host = lastState && lastState.premium ? lastState.premium.host : '?'
     const msg = on
-      ? 'Move "' + premium + '" onto the premium route?\n\nA dedicated DNS record points ' + premium + '.' + lastState.apex + ' at ' + host + ' (DNS only, bypassing the CDN); its agent is told to reconnect through that path. Visitors follow within the DNS TTL.'
-      : 'Move "' + premium + '" back to the standard route?\n\nIts dedicated DNS record is removed (the CDN wildcard takes over again) and its agent reconnects through the default relay host.'
+      ? 'Move "' + premium + '" onto the premium route?\\n\\nA dedicated DNS record points ' + premium + '.' + lastState.apex + ' at ' + host + ' (DNS only, bypassing the CDN); its agent is told to reconnect through that path. Visitors follow within the DNS TTL.'
+      : 'Move "' + premium + '" back to the standard route?\\n\\nIts dedicated DNS record is removed (the CDN wildcard takes over again) and its agent reconnects through the default relay host.'
     if (!confirm(msg)) return
     const r = await act('/__admin/api/premium', premium, { enabled: on })
     if (r) {
