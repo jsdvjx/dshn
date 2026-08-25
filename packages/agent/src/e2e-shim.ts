@@ -36,7 +36,15 @@ const SHIM_BODY = String.raw`
   let resolveReady
   const ready = new Promise((r) => { resolveReady = r })
   const hexToBytes = (hx) => { const a = new Uint8Array(hx.length / 2); for (let i = 0; i < a.length; i++) a[i] = parseInt(hx.substr(i * 2, 2), 16); return a }
-  const isApi = (url) => { try { const u = new URL(url, location.href); return u.origin === location.origin && u.pathname.startsWith('/api') } catch { return false } }
+  // Same host as the page, over http(s) OR ws(s). A wss: URL has the origin
+  // "wss://host", which never equals the page's "https://host", so comparing
+  // origins would leave every event socket undecrypted.
+  const isApi = (url) => {
+    try {
+      const u = new URL(url, location.href)
+      return u.host === location.host && /^(https?|wss?):$/.test(u.protocol) && u.pathname.startsWith('/api')
+    } catch { return false }
+  }
 
   async function deriveKey(password, saltHex) {
     const base = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey'])
@@ -116,7 +124,9 @@ const SHIM_BODY = String.raw`
               : data instanceof Blob ? new Uint8Array(await data.arrayBuffer())
               : new Uint8Array(await new Blob([data]).arrayBuffer())
             const opened = await openBytes(key, raw)
-            data = opened[0] === 0 ? new TextDecoder().decode(opened.subarray(1)) : opened.subarray(1).buffer
+            // slice, not subarray: subarray(1).buffer is the WHOLE decrypted
+            // buffer, type byte included, and would hand the app one extra byte.
+            data = opened[0] === 0 ? new TextDecoder().decode(opened.subarray(1)) : opened.slice(1).buffer
           } catch { return } // drop messages we can't decrypt
         }
       }
