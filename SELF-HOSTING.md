@@ -214,6 +214,25 @@ Cloudflare DNS-01 wildcard:
 The accelerator forwards the real client IP as `X-Forwarded-For`; the relay reads
 the last hop from its trusted proxy, so per-IP login lockout still works.
 
+The accelerator must present a **publicly trusted** certificate for the apex
+wildcard: an agent that pins a self-signed CA for the default relay (`--relay CA`
+in its panel, or `DSHN_ORIGIN_CA`) applies that pin to the default relay only —
+the premium host is verified against the system CAs like any public site.
+
+How the agent moves: on being told it is premium it **probes** the premium host
+(a plain WebSocket handshake, no HELLO) beside its live socket and only redials
+through it once the host answered — a working tunnel is never dropped for a host
+that is down or whose DNS record is still propagating. Three failed probes in a
+row leave the host alone for 5 minutes, then 10, 20, … up to an hour, while the
+control socket stays on the default relay; the panel keeps showing *premium*
+(browsers reach the accelerator by DNS regardless). A successful switch resets
+the schedule.
+
+With managed DNS the relay only creates, retargets, or removes **its own**
+records (matched by target or by the comment it stamps on them). If the name
+already has an `A` record you set by hand, enabling fails with a message naming
+it — remove that record first rather than letting two answers round-robin.
+
 ### 3. Flip it in the admin panel
 
 Open `https://<apex>/__admin`, find the claim, and click **Premium**. With managed

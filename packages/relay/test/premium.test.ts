@@ -30,10 +30,13 @@ class FakeDns implements PremiumDns {
   points: Array<{ name: string; ip: string }> = []
   unpoints: Array<{ name: string; id?: string }> = []
   failNext: string | null = null
+  /** When set, the next point() parks here until the test calls it (simulates a slow API). */
+  holdNext: ((go: () => void) => void) | null = null
   private seq = 1
 
   async point(name: string, ip: string): Promise<DnsRecordRef> {
     if (this.failNext !== null) { const m = this.failNext; this.failNext = null; throw new Error(m) }
+    if (this.holdNext !== null) { const h = this.holdNext; this.holdNext = null; await new Promise<void>((go) => h(go)) }
     this.points.push({ name, ip })
     const ref = { id: `rec-${this.seq++}`, content: ip }
     this.records.set(name, ref)
@@ -209,6 +212,26 @@ describe('premium route', () => {
     await request(port, '/__admin/api/release', { method: 'POST', cookie, json: { subdomain: 'delta' } })
     await until(() => dns.unpoints.some((u) => u.name === `delta.${APEX}`))
     expect(claims.isClaimed('delta')).toBe(false)
+    a.close()
+  })
+
+  it('a claim released while its DNS record is being created leaves no record behind', async () => {
+    const a = new FakeAgent(port, { subdomain: 'golf', password: PASSWORD, deviceId: 'd1', device: 'G' })
+    await a.ready
+    let go: (() => void) | null = null
+    dns.holdNext = (resume) => { go = resume }
+    dns.unpoints = []
+    const pending = premium(port, cookie, 'golf', true)
+    await until(() => go !== null)
+    // The operator releases the claim while the DNS API call is still in flight.
+    await request(port, '/__admin/api/release', { method: 'POST', cookie, json: { subdomain: 'golf' } })
+    expect(claims.isClaimed('golf')).toBe(false)
+    go!()
+    const r = await pending
+    expect(r.status).toBe(404)
+    // The record that was created for a claim that no longer exists is removed again.
+    await until(() => dns.unpoints.some((u) => u.name === `golf.${APEX}`))
+    expect(dns.records.has(`golf.${APEX}`)).toBe(false)
     a.close()
   })
 

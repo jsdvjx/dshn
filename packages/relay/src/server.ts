@@ -705,7 +705,16 @@ export class RelayServer {
             return { status: 502, body: { error: `DNS update failed: ${(err as Error).message}` } }
           }
         }
-        this.opts.claims.setPremium(sub, { since: Date.now(), ...(dns === undefined ? {} : { dns }) })
+        if (!this.opts.claims.setPremium(sub, { since: Date.now(), ...(dns === undefined ? {} : { dns }) })) {
+          // The claim went away (released/banned) while DNS was being updated:
+          // nothing may keep pointing a name nobody holds at the accelerator.
+          if (p.dns !== undefined) {
+            await p.dns.unpoint(name, dns?.id, p.host).catch((err: unknown) => {
+              console.error(`dshn-relay: cannot remove the premium DNS record of "${sub}": ${(err as Error).message}`)
+            })
+          }
+          return { status: 404, body: { error: 'no such claim' } }
+        }
         this.notifyRoute(sub)
       }
     } else if (current !== null) {

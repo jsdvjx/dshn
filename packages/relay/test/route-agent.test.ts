@@ -17,7 +17,7 @@ import { AgentTunnel, fileStore } from '../../agent/lib/index.js'
 import type { PremiumDns, DnsRecordRef } from '../src/dns.js'
 
 const require = createRequire(new URL('../../agent/package.json', import.meta.url))
-const { WebSocketServer } = require('ws') as typeof import('ws')
+const { WebSocket, WebSocketServer } = require('ws') as typeof import('ws')
 
 const APEX = 'test.local'
 const SUB = 'router'
@@ -35,12 +35,38 @@ async function until(cond: () => boolean, ms = 6000): Promise<void> {
   while (!cond()) { if (Date.now() - start > ms) throw new Error('timeout'); await sleep(20) }
 }
 
-function fakeOrigin(): { server: http.Server; port: number } {
+function fakeOrigin(): { server: http.Server; port: number; live: Set<InstanceType<typeof WebSocket>> } {
   const server = http.createServer((_req, res) => { res.writeHead(200); res.end('ok') })
   const wss = new WebSocketServer({ server })
-  wss.on('connection', () => { /* keep-open */ })
+  // Every browser socket the agent replays to this origin, while it is open.
+  const live = new Set<InstanceType<typeof WebSocket>>()
+  wss.on('connection', (ws) => { live.add(ws); ws.on('close', () => live.delete(ws)) })
   server.listen(0)
-  return { server, port: (server.address() as any).port }
+  return { server, port: (server.address() as any).port, live }
+}
+
+/** Log in to the tunnel as a visitor and return the session cookie. */
+function visitorLogin(port: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path: '/__dshn/login', method: 'POST' }, (r) => {
+      r.on('data', () => {})
+      r.on('end', () => {
+        const cookie = ([] as string[]).concat(r.headers['set-cookie'] ?? []).find((c) => c.startsWith('dshn_sess='))
+        cookie === undefined ? reject(new Error(`login ${r.statusCode}: no session cookie`)) : resolve(cookie.split(';', 1)[0])
+      })
+    })
+    req.setHeader('host', `${SUB}.${APEX}`); req.setHeader('content-type', 'application/x-www-form-urlencoded')
+    req.on('error', reject); req.end(`password=${PASSWORD}`)
+  })
+}
+
+/** Open a browser-side WebSocket through the tunnel (relay → agent → origin). */
+function visitorSocket(port: number, cookie: string): Promise<InstanceType<typeof WebSocket>> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/events`, { headers: { host: `${SUB}.${APEX}`, cookie } })
+    ws.on('open', () => resolve(ws))
+    ws.on('error', reject)
+  })
 }
 
 async function adminLogin(port: number): Promise<string> {
@@ -86,7 +112,7 @@ describe('agent follows relay-assigned routes', () => {
       // The premium host is a full ws:// URL so the agent redials this same relay
       // (a real deploy points a DNS name at the accelerator; here we just prove
       // the agent switches the authority it dials).
-      premium: { host: premiumHost, dns, routeHost: () => `ws://127.0.0.1:${port}` },
+      premium: { host: premiumHost, dns, routeHost: () => `ws://localhost:${port}` }, // a DIFFERENT authority for the same relay, so the agent really moves
     })
     await new Promise<void>((r) => relay.listen(r))
     port = relay.port()
@@ -107,7 +133,8 @@ describe('agent follows relay-assigned routes', () => {
 
     expect(await setPremium(port, cookie, true)).toBe(200)
     await until(() => tunnel!.info().route === 'premium' && tunnel!.status.connected)
-    // The agent persisted the announced premium host and is dialling it.
+    // The agent persisted the announced premium host and moved its control socket onto it.
+    await until(() => tunnel!.info().relayHost === `localhost:${port}`)
     expect(tunnel!.relaySettings().relayHost).toBe('') // default relay unchanged
 
     expect(await setPremium(port, cookie, false)).toBe(200)
@@ -128,19 +155,64 @@ describe('agent follows relay-assigned routes', () => {
     void deadPort
     startAgent()
     await until(() => tunnel!.status.connected)
+    const since = tunnel!.info().connectedSince
     await setPremium(port, cookie, true)
-    // It tries the dead premium host (dropping the live tunnel briefly), fails
-    // ROUTE_FAIL_MAX times, then dials the default relay again and reconnects.
-    // It tries the dead premium host, fails, and after a few tries keeps its
-    // control socket on the DEFAULT relay — the tunnel settles UP there. The
-    // displayed route stays 'premium' (the operator's assignment; browsers reach
-    // the accelerator by DNS regardless of where the agent's own socket is).
+    // The dead premium host is PROBED beside the live socket, never blindly
+    // dialled in its place: the control socket stays on the DEFAULT relay the
+    // whole time and the tunnel never drops. The displayed route is 'premium'
+    // (the operator's assignment; browsers reach the accelerator by DNS
+    // regardless of where the agent's own socket is).
     await until(() => tunnel!.info().route === 'premium', 8000)
-    await until(() => tunnel!.status.connected && tunnel!.info().relayHost === `127.0.0.1:${port}`, 25000)
-    // And it stays settled there (no reconnect loop onto the dead accelerator).
     await sleep(1500)
     expect(tunnel!.status.connected).toBe(true)
+    expect(tunnel!.info().connectedSince).toBe(since) // the same connection — it was never dropped
     expect(tunnel!.info().relayHost).toBe(`127.0.0.1:${port}`)
     expect(tunnel!.info().route).toBe('premium')
-  }, 32000)
+    expect(tunnel!.info().routeHost).toBe('ws://127.0.0.1:1')
+  }, 15000)
+
+  it('tears down the streams of the abandoned connection when it moves route', async () => {
+    await startRelay('198.51.100.7')
+    startAgent()
+    await until(() => tunnel!.status.connected)
+    const session = await visitorLogin(port)
+    const browser = await visitorSocket(port, session)
+    await until(() => origin.live.size === 1)
+
+    let browserClosed = false
+    browser.on('close', () => { browserClosed = true })
+    expect(await setPremium(port, cookie, true)).toBe(200)
+    await until(() => tunnel!.info().route === 'premium' && tunnel!.status.connected && tunnel!.info().routeHost !== null)
+    // The agent redialled through the premium host. The origin-side socket of
+    // the OLD connection must be gone — the new connection numbers its streams
+    // from 1 again, and a survivor would answer to a stranger's id.
+    await until(() => origin.live.size === 0 && browserClosed, 4000)
+
+    // A fresh visitor socket over the new connection works.
+    const browser2 = await visitorSocket(port, session)
+    await until(() => origin.live.size === 1)
+    browser2.close()
+    await until(() => origin.live.size === 0)
+  }, 15000)
+
+  it('forgets a remembered premium host when the relay stops announcing routes', async () => {
+    await startRelay('198.51.100.7')
+    startAgent()
+    await until(() => tunnel!.status.connected)
+    expect(await setPremium(port, cookie, true)).toBe(200)
+    await until(() => tunnel!.info().route === 'premium' && tunnel!.status.connected && tunnel!.info().routeHost !== null)
+
+    // The operator restarts the relay WITHOUT the premium feature (same port,
+    // same claims). Its READY carries no route: the agent must drop the stale
+    // premium host instead of dialling it forever.
+    relay.close()
+    relay = new RelayServer({
+      apex: APEX, port, cookieSecret: 'cookie-secret-value-here-01', claims: ClaimStore.fromFile(join(dir, 'claims.json')),
+      adminPassword: ADMIN_PW,
+    })
+    await new Promise<void>((r) => relay.listen(r))
+    await until(() => tunnel!.status.connected && tunnel!.info().routeHost === null, 12000)
+    expect(tunnel!.info().route).toBe('standard')
+    expect(tunnel!.info().relayHost).toBe(`127.0.0.1:${port}`)
+  }, 20000)
 })

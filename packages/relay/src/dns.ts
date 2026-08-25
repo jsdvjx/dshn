@@ -3,7 +3,9 @@
  * pointing that ONE hostname at the accelerator node with a dedicated,
  * un-proxied record that shadows the CDN'd wildcard; disabling removes it so
  * the wildcard takes over again. The relay only ever touches records it
- * created for this purpose (matched by name, type A, and the accelerator IP).
+ * created for this purpose (matched by name, type A, and either the
+ * accelerator IP or the comment it stamps on them); a same-name record of the
+ * operator's makes enabling fail with a message instead.
  *
  * The provider is an interface so the relay can run with no DNS credentials at
  * all (the operator then sets the record by hand — the admin panel tells them
@@ -49,6 +51,7 @@ interface CfRecord {
   name: string
   content: string
   proxied: boolean
+  comment?: string | null
 }
 
 /** Cloudflare DNS, through a zone-scoped API token (Zone → DNS → Edit). */
@@ -86,9 +89,16 @@ export class CloudflareDns implements PremiumDns {
     const existing = await this.findA(name)
     const ours = existing.find((r) => r.content === ip)
     if (ours !== undefined && !ours.proxied) return { id: ours.id, content: ours.content }
-    // A stray A record of that exact name would keep shadowing the wildcard with
-    // the wrong target; reuse the first one rather than leaving two answers.
-    const reuse = ours ?? existing[0]
+    // Reuse a record of ours (same target, or stamped with our comment from an
+    // earlier accelerator address) rather than leaving two answers. Any OTHER A
+    // record of that exact name belongs to the operator: adding ours beside it
+    // would round-robin the name between two targets, and rewriting it would
+    // destroy something the relay did not create — so refuse and say why.
+    const reuse = ours ?? existing.find((r) => r.comment === RECORD_COMMENT)
+    if (reuse === undefined && existing.length > 0) {
+      const targets = existing.map((r) => r.content).join(', ')
+      throw new Error(`"${name}" already has an A record (${targets}) not managed by the relay; remove it first`)
+    }
     const payload = { type: 'A', name, content: ip, proxied: false, ttl: PREMIUM_TTL_S, comment: RECORD_COMMENT }
     const rec = reuse === undefined
       ? await this.call<CfRecord>('POST', '', payload)

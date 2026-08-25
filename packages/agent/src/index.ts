@@ -251,13 +251,18 @@ interface TunnelStatus {
 }
 
 /**
- * Consecutive failed dials of the premium host before the agent falls back to
- * its default relay host for a while. The relay then re-announces the route on
- * READY, so the premium path is retried automatically each fallback period.
+ * Consecutive failed dials/probes of the premium host before the agent leaves
+ * it alone for a fallback period and keeps its control socket on the default
+ * relay. Each exhausted period doubles the next one (up to a cap), so a dead
+ * accelerator is probed ever more rarely; a successful premium READY resets it.
  */
 const ROUTE_FAIL_MAX = 3
-/** How long a failed premium host is left alone before it is dialled again. */
+/** The first fallback period after the premium host failed ROUTE_FAIL_MAX times. */
 const ROUTE_FALLBACK_MS = 5 * 60_000
+/** The longest the premium host is left alone between probes. */
+const ROUTE_FALLBACK_MAX_MS = 60 * 60_000
+/** How long a probe of the premium host waits for the WebSocket handshake. */
+const ROUTE_PROBE_TIMEOUT_MS = 10_000
 
 /**
  * A relay-supplied route host must be a plain authority (`host[:port]`) or a
@@ -373,10 +378,14 @@ export class AgentTunnel {
   private pingSentAt = 0
   /** The authority the current control socket was dialled through. */
   private dialledHost: string | null = null
-  /** Consecutive dials of the premium host that died before READY. */
+  /** Consecutive dials/probes of the premium host that failed. */
   private routeFails = 0
   /** Until when (ms epoch) the premium host is skipped in favour of the default relay. */
   private routeFallbackUntil = 0
+  /** The next fallback period (grows while the premium host keeps failing). */
+  private routeFallbackMs = ROUTE_FALLBACK_MS
+  /** The in-flight probe of the premium host, if one is running. */
+  private routeProbe: Promise<void> | null = null
 
   constructor(private readonly config: AgentConfig, private readonly localPort: () => number, private readonly store: CredsStore) {
     this.deviceId = createHash('sha256').update(`${hostname()}|${config.statePath}`).digest('hex').slice(0, 12)
@@ -443,6 +452,11 @@ export class AgentTunnel {
     const sameTarget = this.creds?.subdomain === label && (this.creds?.relayHost ?? '') === (rh || '')
     this.creds = { subdomain: label, password: String(password), e2ePassword: this.creds?.e2ePassword, e2eSalt: this.creds?.e2eSalt, relayHost: rh || undefined, originCa: ca || undefined, routeHost: sameTarget ? this.creds?.routeHost : undefined }
     this.status.route = null
+    if (!sameTarget) {
+      this.routeFails = 0
+      this.routeFallbackUntil = 0
+      this.routeFallbackMs = ROUTE_FALLBACK_MS
+    }
     this.refreshE2E()
     this.saveCreds(this.creds)
     this.status.configured = true
@@ -545,6 +559,7 @@ export class AgentTunnel {
     this.status.route = null
     this.routeFails = 0
     this.routeFallbackUntil = 0
+    this.routeFallbackMs = ROUTE_FALLBACK_MS
     if (this.reconnectTimer !== null) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
     this.control?.close()
     this.control = null
@@ -559,13 +574,25 @@ export class AgentTunnel {
     this.stopped = true
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer)
     if (this.heartbeatTimer !== null) clearInterval(this.heartbeatTimer)
+    this.dropStreams()
+    this.control?.close()
+    this.control = null
+    this.status.connected = false
+  }
+
+  /**
+   * Tear down every stream bridged over the current control socket. Must run
+   * whenever that socket is abandoned — on close AND on a deliberate redial —
+   * because the relay numbers streams per connection from 1: a request or
+   * browser socket left over from the old connection would otherwise answer to
+   * the ids of the new one and leak its bytes into a stranger's stream.
+   */
+  private dropStreams(): void {
     for (const req of this.requests.values()) req.destroy()
     for (const sock of this.sockets.values()) sock.close()
     this.requests.clear()
     this.sockets.clear()
-    this.control?.close()
-    this.control = null
-    this.status.connected = false
+    this.reqE2E.clear()
   }
 
   /**
@@ -603,7 +630,8 @@ export class AgentTunnel {
    * Neither case changes the displayed route or breaks the tunnel.
    *
    * - `premium` with a usable host: show premium, remember the host, and (unless
-   *   in a fallback window) redial through it to accelerate the uplink as well.
+   *   in a fallback window) PROBE it; only a host that answers gets the control
+   *   socket moved onto it — a working tunnel is never dropped for a dead host.
    * - `standard`: the operator withdrew the fast path — show standard, forget
    *   the host, and return the control socket to the default relay.
    */
@@ -614,10 +642,12 @@ export class AgentTunnel {
       if (this.creds.routeHost !== routeHost) {
         this.creds = { ...this.creds, routeHost }
         this.saveCreds(this.creds)
+        // A different premium host: what failed before says nothing about it.
+        this.routeFails = 0
+        this.routeFallbackUntil = 0
+        this.routeFallbackMs = ROUTE_FALLBACK_MS
       }
-      // Move the uplink onto the premium host too, when it's worth a redial and
-      // not currently being skipped after repeated failures.
-      if (!this.inRouteFallback() && this.dialledHost !== routeHost) this.redial()
+      this.tryPremium()
       return
     }
     if (route === 'standard' || route === 'premium') {
@@ -625,6 +655,7 @@ export class AgentTunnel {
       this.status.route = 'standard'
       this.routeFallbackUntil = 0
       this.routeFails = 0
+      this.routeFallbackMs = ROUTE_FALLBACK_MS
       const hadRoute = this.creds.routeHost !== undefined && this.creds.routeHost !== ''
       if (hadRoute) {
         this.creds = { ...this.creds, routeHost: undefined }
@@ -634,12 +665,73 @@ export class AgentTunnel {
     }
   }
 
+  /**
+   * Move the control socket onto the premium host when that is worth doing:
+   * assigned premium, currently on the default relay, not in a fallback window,
+   * and no probe already running. The host is probed first (a plain WebSocket
+   * handshake, no HELLO — so the relay never sees a second agent) and the live
+   * socket is only redialled once the host has answered. A failed probe counts
+   * like a failed dial; enough of them open a fallback window.
+   */
+  private tryPremium(): void {
+    const host = this.creds?.routeHost
+    if (host === undefined || host === '' || this.routeProbe !== null) return
+    if (!this.status.connected || this.onPremiumPath() || this.inRouteFallback()) return
+    this.routeProbe = this.probeHost(host).then((ok) => {
+      this.routeProbe = null
+      // Anything may have changed while the probe ran: creds forgotten, route
+      // withdrawn, host replaced, tunnel already moved. Only act if it still applies.
+      if (this.stopped || this.creds?.routeHost !== host || this.status.route !== 'premium') return
+      if (!this.status.connected || this.onPremiumPath()) return
+      if (ok) this.redial()
+      else this.noteRouteFailure()
+    })
+  }
+
+  /** Whether `host` accepts a WebSocket on the agent path right now (no HELLO is sent). */
+  private probeHost(host: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const base = host.includes('://') ? host : `wss://${host}`
+      let ws: WebSocket
+      try {
+        ws = new WebSocket(`${base}${AGENT_WS_PATH}`, { handshakeTimeout: ROUTE_PROBE_TIMEOUT_MS })
+      } catch {
+        resolve(false)
+        return
+      }
+      let done = false
+      const finish = (ok: boolean): void => {
+        if (done) return
+        done = true
+        if (process.env.DSHN_DEBUG) console.error(`[dshn-agent] premium probe of ${host}: ${ok ? 'reachable' : 'unreachable'}`)
+        resolve(ok)
+        if (ok) ws.close()
+        else ws.terminate()
+      }
+      ws.on('open', () => finish(true))
+      ws.on('error', () => finish(false))
+      ws.on('close', () => finish(false))
+    })
+  }
+
+  /** Count a failed dial/probe of the premium host; enough in a row open a (growing) fallback window. */
+  private noteRouteFailure(): void {
+    this.routeFails++
+    if (this.routeFails < ROUTE_FAIL_MAX) return
+    this.routeFails = 0
+    this.routeFallbackUntil = Date.now() + this.routeFallbackMs
+    this.routeFallbackMs = Math.min(this.routeFallbackMs * 2, ROUTE_FALLBACK_MAX_MS)
+  }
+
   /** Drop the live socket and dial again right away (route change). */
   private redial(): void {
     if (process.env.DSHN_DEBUG) console.error(`[dshn-agent] route change → redialling via ${this.dialHost()}`)
     this.backoffMs = 1_000
     const ws = this.control
     this.control = null
+    // Streams bridged over the abandoned socket die with it (see dropStreams);
+    // the new connection numbers its streams from 1 again.
+    this.dropStreams()
     ws?.close()
     // The closed socket's handler sees it is no longer `this.control` and stays
     // quiet; this fresh connect owns the reconnect chain from here.
@@ -669,9 +761,11 @@ export class AgentTunnel {
     const wsOpts: Record<string, unknown> = { maxPayload: 512 * 1024 * 1024 }
     // Pin a self-signed relay's cert (as the sole CA) so validation stays strict
     // without a public CA. Also used for a direct off-Cloudflare origin. The PEM
-    // is either pasted inline in the UI or an env-configured file path.
+    // is either pasted inline in the UI or an env-configured file path. It pins
+    // the DEFAULT relay only: a premium host is a separate edge with its own
+    // (publicly trusted) certificate, which the pinned CA would always reject.
     const ca = this.effectiveOriginCa()
-    if (ca !== null) wsOpts.ca = ca
+    if (ca !== null && relayHost === this.effectiveRelayHost()) wsOpts.ca = ca
     const ws = new WebSocket(`${base}${AGENT_WS_PATH}`, wsOpts)
     this.control = ws
     if (process.env.DSHN_DEBUG) console.error(`[dshn-agent] connect() opening new ws (backoff=${this.backoffMs})`)
@@ -726,12 +820,10 @@ export class AgentTunnel {
         return
       }
       // Assigned premium but the uplink is still on the default relay and the
-      // fallback window has passed: retry the premium host now (the DNS record
-      // has had time to propagate, or the accelerator has recovered).
-      if (this.status.route === 'premium' && this.creds?.routeHost && !this.onPremiumPath() && !this.inRouteFallback()) {
-        this.redial()
-        return
-      }
+      // fallback window has passed: probe the premium host again (the DNS record
+      // has had time to propagate, or the accelerator has recovered). The probe
+      // runs beside the live socket; only a host that answers gets it.
+      if (this.status.route === 'premium') this.tryPremium()
       this.sendPing()
     }, LATENCY_PING_MS)
   }
@@ -742,13 +834,7 @@ export class AgentTunnel {
     // a while (the premium DNS record may just be propagating). Browser traffic
     // is unaffected — it reaches the accelerator by DNS regardless — so this is
     // silent: the displayed route stays on the operator's assignment.
-    if (!this.status.connected && this.onPremiumPath()) {
-      this.routeFails++
-      if (this.routeFails >= ROUTE_FAIL_MAX) {
-        this.routeFails = 0
-        this.routeFallbackUntil = Date.now() + ROUTE_FALLBACK_MS
-      }
-    }
+    if (!this.status.connected && this.onPremiumPath()) this.noteRouteFailure()
     this.status.connected = false
     this.connectedSince = null
     this.latencyMs = null
@@ -758,10 +844,7 @@ export class AgentTunnel {
       clearInterval(this.heartbeatTimer)
       this.heartbeatTimer = null
     }
-    for (const req of this.requests.values()) req.destroy()
-    for (const sock of this.sockets.values()) sock.close()
-    this.requests.clear()
-    this.sockets.clear()
+    this.dropStreams()
     if (this.stopped) return
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer)
     // Exponential backoff, capped, so a down relay is not hammered.
@@ -806,15 +889,20 @@ export class AgentTunnel {
       case 'ready':
         this.backoffMs = 1_000
         this.routeFails = 0
+        // The premium host answered with a READY: it is healthy again, so the
+        // next failure streak starts from the shortest fallback period.
+        if (this.onPremiumPath()) this.routeFallbackMs = ROUTE_FALLBACK_MS
         this.status.connected = true
         this.status.publicUrl = frame.publicUrl
         this.status.subdomain = frame.subdomain
         this.status.lastError = null
         this.connectedSince = Date.now()
         this.sendPing() // measure latency immediately, don't wait a full interval
-        // A route-aware relay says which path this tunnel is on; an older relay
-        // says nothing and the tunnel simply stays where it dialled.
+        // A route-aware relay says which path this tunnel is on. One that says
+        // nothing (older, or premium switched off) has no premium route: forget
+        // a remembered premium host rather than dialling it forever.
         if (frame.route !== undefined) this.applyRoute(frame.route, frame.routeHost)
+        else if (this.creds?.routeHost) this.applyRoute('standard', undefined)
         break
       case 'route':
         this.applyRoute(frame.route, frame.routeHost)
