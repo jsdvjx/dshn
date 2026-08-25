@@ -35,7 +35,7 @@ copyFileSync('README.zh.md', 'dist/dshn/README.zh.md')
 copyFileSync('LICENSE', 'dist/dshn/LICENSE')
 writeFileSync('dist/dshn/package.json', JSON.stringify({
   name: '@dshn/agent',
-  version: '0.3.0',
+  version: '0.3.1',
   description: 'Forward a local dsh web service to the public internet over ds.hn (bundled).',
   keywords: ['dsh', 'dsh-plugin', 'deepseek-harness', 'tunnel', 'forwarding', 'ds.hn'],
   license: 'MIT',

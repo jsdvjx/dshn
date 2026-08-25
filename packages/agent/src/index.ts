@@ -46,6 +46,7 @@ import {
   type TunnelRoute,
 } from '@dshn/protocol'
 import { deriveKey, newSalt, open as e2eOpen, seal as e2eSeal } from './crypto.js'
+import { injectE2EBootstrap } from './e2e-shim.js'
 
 export const name = '@dshn/agent'
 
@@ -1017,9 +1018,36 @@ export class AgentTunnel {
       return
     }
 
+    // When E2E is on, every HTML document a browser navigates to gets the E2E
+    // bootstrap injected at the top of its <head>, so fetch/WebSocket are
+    // patched before any of dsh's own scripts run (dsh opens its event socket
+    // and fires its first /api calls while plugin client modules are still
+    // loading — a shim delivered as a module arrives too late for those).
+    const wantsDocument = method === 'GET'
+      && headers.some(([k, v]) => k.toLowerCase() === 'accept' && v.includes('text/html'))
+    const injectBootstrap = this.e2eKey !== null && wantsDocument
+    if (injectBootstrap) outHeaders['accept-encoding'] = 'identity' // we need the plaintext to edit it
+
     const req = http.request(
       { host: this.config.localHost, port: this.localPort(), method, path, headers: outHeaders },
       (res) => {
+        const contentType = String(res.headers['content-type'] ?? '')
+        if (injectBootstrap && this.e2eKey !== null && res.statusCode === 200 && /^text\/html\b/i.test(contentType)) {
+          const chunks: Buffer[] = []
+          res.on('data', (c: Buffer) => chunks.push(c))
+          res.on('end', () => {
+            const html = injectE2EBootstrap(Buffer.concat(chunks).toString('utf8'), { salt: this.e2eSalt, device: this.deviceId })
+            const body = Buffer.from(html, 'utf8')
+            const resHeaders = filterHeaders(headerListFromRaw(res.rawHeaders),
+              new Set([...HOP_BY_HOP, 'content-length', 'content-encoding']))
+            resHeaders.push(['content-length', String(body.length)])
+            this.send({ t: 'res_head', id, status: 200, headers: resHeaders })
+            this.sendData(DATA_RES_BODY, id, body)
+            this.send({ t: 'res_end', id })
+          })
+          res.on('error', () => this.send({ t: 'abort', id, reason: 'response stream error' }))
+          return
+        }
         this.send({
           t: 'res_head',
           id,
