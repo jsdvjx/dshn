@@ -274,6 +274,21 @@ export function e2eBootstrapTag(info: E2EBootstrapInfo): string {
 }
 
 /**
+ * Make every `<link rel="manifest">` fetch with credentials. Browsers fetch a
+ * web app manifest WITHOUT cookies unless the link says
+ * `crossorigin="use-credentials"`, so behind the relay's login the manifest
+ * request came back as the login page and the console logged
+ * "Manifest: Line: 1, column: 1, Syntax error." on every load. Links that
+ * already carry a crossorigin attribute are left alone.
+ */
+export function credentialManifestLinks(html: string): string {
+  return html.replace(/<link\b[^>]*>/gi, (tag) => {
+    if (!/\brel\s*=\s*["']?manifest\b/i.test(tag) || /\bcrossorigin\b/i.test(tag)) return tag
+    return tag.replace(/\s*\/?>$/, (end) => ` crossorigin="use-credentials"${end.trim() === '/>' ? ' />' : '>'}`)
+  })
+}
+
+/**
  * Insert the bootstrap tag as the first thing inside `<head>` (or `<html>`, or
  * at the very start when neither is present), so it runs before any script the
  * document itself carries.

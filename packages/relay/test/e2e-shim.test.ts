@@ -13,14 +13,16 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { ClaimStore } from '../src/claims.js'
 import { RelayServer } from '../src/server.js'
 import { AgentTunnel, fileStore } from '../../agent/lib/index.js'
-import { e2eBootstrapTag, injectE2EBootstrap } from '../../agent/lib/e2e-shim.js'
+import { credentialManifestLinks, e2eBootstrapTag, injectE2EBootstrap } from '../../agent/lib/e2e-shim.js'
 
 const APEX = 'test.local'
 const SUB = 'sealed'
 const PASSWORD = 'password123'
 const E2E_PW = 'e2e-secret-pw'
 const INFO = { salt: 'e3f5c44283c186739ee2064db15793ef', device: '123d3ef65aae' }
-const SHELL = '<!doctype html>\n<html lang="en">\n  <head><script>window.__first = "dsh"</script><title>t</title></head><body>app</body></html>'
+const SHELL = '<!doctype html>\n<html lang="en">\n  <head><script>window.__first = "dsh"</script><link rel="manifest" href="/manifest.webmanifest" /><title>t</title></head><body>app</body></html>'
+/** SHELL as every tunnelled navigation sees it: the manifest link fetches with credentials. */
+const SHELL_OUT = SHELL.replace('<link rel="manifest" href="/manifest.webmanifest" />', '<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />')
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 async function until(cond: () => boolean, ms = 6000): Promise<void> {
@@ -41,6 +43,14 @@ describe('E2E bootstrap injection', () => {
     expect(injectE2EBootstrap('<html><body>x</body></html>', INFO).startsWith('<html><script>')).toBe(true)
     expect(injectE2EBootstrap('<body>x</body>', INFO).startsWith('<script>')).toBe(true)
     expect(injectE2EBootstrap('<HEAD data-x="1">y</HEAD>', INFO).startsWith('<HEAD data-x="1"><script>')).toBe(true)
+  })
+
+  it('makes manifest links fetch with credentials, leaving other links and explicit ones alone', () => {
+    expect(credentialManifestLinks(SHELL)).toBe(SHELL_OUT)
+    expect(credentialManifestLinks('<link rel="manifest" href="/m.json">')).toBe('<link rel="manifest" href="/m.json" crossorigin="use-credentials">')
+    expect(credentialManifestLinks('<link href="/m.json" rel=manifest>')).toBe('<link href="/m.json" rel=manifest crossorigin="use-credentials">')
+    const keep = '<link rel="stylesheet" href="/a.css"><link rel="manifest" href="/m.json" crossorigin="anonymous">'
+    expect(credentialManifestLinks(keep)).toBe(keep)
   })
 
   it('is one script that parses, carries the info inline and cannot break out of the tag', () => {
@@ -100,7 +110,7 @@ describe('E2E bootstrap through a real tunnel', () => {
     expect(res.status).toBe(200)
     const html = res.body.toString('utf8')
     const info = tunnel.e2eInfo()
-    expect(html).toBe(injectE2EBootstrap(SHELL, { salt: info.salt, device: tunnel.deviceId }))
+    expect(html).toBe(injectE2EBootstrap(SHELL_OUT, { salt: info.salt, device: tunnel.deviceId }))
     expect(html.indexOf('(function (__dshnInfo)')).toBeLessThan(html.indexOf('window.__first'))
     expect(Number(res.headers['content-length'])).toBe(res.body.length)
     // The origin was asked for plaintext so the document could be edited.
@@ -120,9 +130,10 @@ describe('E2E bootstrap through a real tunnel', () => {
     expect(api.body.toString('utf8')).not.toContain('"ok"')
   })
 
-  it('injects nothing once E2E is switched off', async () => {
+  it('with E2E off still fixes the manifest link but injects no bootstrap', async () => {
     expect(tunnel.setE2E('')).toBeNull()
     const res = await request('/', { cookie: session, accept: 'text/html' })
-    expect(res.body.toString('utf8')).toBe(SHELL)
+    expect(res.body.toString('utf8')).toBe(SHELL_OUT)
+    expect(Number(res.headers['content-length'])).toBe(res.body.length)
   })
 })
