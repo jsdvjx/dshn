@@ -10,9 +10,12 @@
  * clear. Verification is constant-time. The store persists to a JSON file with
  * an atomic write so a crash mid-write cannot corrupt it.
  */
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
-import { readFileSync, writeFileSync, renameSync } from 'node:fs'
+import { randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto'
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs'
+import { promisify } from 'node:util'
 import { isValidSubdomainLabel } from '@dshn/protocol'
+
+const scrypt = promisify(scryptCb) as (password: string, salt: Buffer, keylen: number) => Promise<Buffer>
 
 interface ClaimRecord {
   /** Hex scrypt hash of the password. */
@@ -65,9 +68,59 @@ export interface ClaimResult {
 
 const SCRYPT_KEYLEN = 32
 
-/** Hash a password with a fresh or given salt. */
-function hashPassword(password: string, saltHex: string): string {
-  return scryptSync(password, Buffer.from(saltHex, 'hex'), SCRYPT_KEYLEN).toString('hex')
+/** Longest password the store will hash (scrypt cost is per byte of input too). */
+const MAX_PASSWORD_LENGTH = 256
+
+/** How long device-touch persists are coalesced before hitting the disk. */
+const LAZY_PERSIST_MS = 500
+
+/**
+ * Hash a password with a fresh or given salt. Async: scrypt runs on the
+ * libuv threadpool, so a burst of HELLOs cannot stall every tenant's frames.
+ */
+function hashPassword(password: string, saltHex: string): Promise<string> {
+  return scrypt(password, Buffer.from(saltHex, 'hex'), SCRYPT_KEYLEN).then((buf) => buf.toString('hex'))
+}
+
+const HEX = /^[0-9a-f]+$/i
+
+/**
+ * Validate one on-disk claim record. The store is the relay's authority on
+ * ownership, so a record it cannot vouch for is a startup error, never an
+ * "empty" claim that would let the name be taken over.
+ */
+function checkRecord(subdomain: string, raw: unknown): ClaimRecord {
+  const bad = (why: string): never => { throw new Error(`claim "${subdomain}": ${why}`) }
+  if (raw === null || typeof raw !== 'object') return bad('not an object')
+  const r = raw as Record<string, unknown>
+  if (typeof r.hash !== 'string' || r.hash.length !== SCRYPT_KEYLEN * 2 || !HEX.test(r.hash)) return bad('bad hash')
+  if (typeof r.salt !== 'string' || r.salt.length < 16 || !HEX.test(r.salt)) return bad('bad salt')
+  if (typeof r.createdAt !== 'number' || !Number.isFinite(r.createdAt)) return bad('bad createdAt')
+  const out: ClaimRecord = { hash: r.hash, salt: r.salt, createdAt: r.createdAt }
+  if (r.devices !== undefined) {
+    if (r.devices === null || typeof r.devices !== 'object') return bad('bad devices')
+    const devices: Record<string, DeviceRecord> = {}
+    for (const [id, d] of Object.entries(r.devices as Record<string, unknown>)) {
+      if (d === null || typeof d !== 'object') return bad(`bad device ${id}`)
+      const dev = d as Record<string, unknown>
+      if (typeof dev.name !== 'string' || typeof dev.lastSeen !== 'number') return bad(`bad device ${id}`)
+      devices[id] = { name: dev.name, lastSeen: dev.lastSeen }
+    }
+    out.devices = devices
+  }
+  if (r.premium !== undefined) {
+    if (r.premium === null || typeof r.premium !== 'object') return bad('bad premium')
+    const p = r.premium as Record<string, unknown>
+    if (typeof p.since !== 'number') return bad('bad premium.since')
+    const premium: PremiumRecord = { since: p.since }
+    if (p.dns !== undefined) {
+      const dns = p.dns as Record<string, unknown> | null
+      if (dns === null || typeof dns !== 'object' || typeof dns.id !== 'string' || typeof dns.content !== 'string') return bad('bad premium.dns')
+      premium.dns = { id: dns.id, content: dns.content }
+    }
+    out.premium = premium
+  }
+  return out
 }
 
 /** Constant-time hex-string compare. */
@@ -87,36 +140,80 @@ export class ClaimStore {
   }
 
   /**
-   * Load a claim store from disk, or start empty if the file is absent.
+   * Load a claim store from disk. An ABSENT file is a fresh install (empty
+   * store; the first claim creates it). A file that exists but cannot be read,
+   * parsed, or validated is a hard error: starting with an empty store would
+   * silently make every existing name claimable by anyone. Move the file aside
+   * deliberately if a reset is really wanted.
    * @param path - JSON file backing the store.
    * @returns the store.
    */
   static fromFile(path: string): ClaimStore {
+    if (!existsSync(path)) return new ClaimStore(path)
+    let raw: { claims?: unknown; banned?: unknown }
     try {
-      const raw = JSON.parse(readFileSync(path, 'utf8')) as { claims?: Record<string, ClaimRecord>; banned?: string[] }
-      return new ClaimStore(path, raw.claims ?? {}, raw.banned ?? [])
-    } catch {
-      // Absent or unreadable → a fresh store; first claim will create the file.
-      return new ClaimStore(path)
+      raw = JSON.parse(readFileSync(path, 'utf8')) as { claims?: unknown; banned?: unknown }
+    } catch (err) {
+      throw new Error(`claims file ${path} is unreadable or not JSON (${(err as Error).message}); refusing to start with an empty store — move it aside to reset`)
     }
+    if (raw === null || typeof raw !== 'object') throw new Error(`claims file ${path}: not an object`)
+    const claims: Record<string, ClaimRecord> = {}
+    if (raw.claims !== undefined) {
+      if (raw.claims === null || typeof raw.claims !== 'object') throw new Error(`claims file ${path}: "claims" is not an object`)
+      for (const [sub, rec] of Object.entries(raw.claims as Record<string, unknown>)) {
+        try {
+          claims[sub] = checkRecord(sub, rec)
+        } catch (err) {
+          throw new Error(`claims file ${path}: ${(err as Error).message}; refusing to start — move it aside to reset`)
+        }
+      }
+    }
+    const banned: string[] = []
+    if (raw.banned !== undefined) {
+      if (!Array.isArray(raw.banned) || raw.banned.some((b) => typeof b !== 'string')) throw new Error(`claims file ${path}: "banned" is not a list of names`)
+      banned.push(...(raw.banned as string[]))
+    }
+    return new ClaimStore(path, claims, banned)
   }
 
+  private lazyTimer: ReturnType<typeof setTimeout> | null = null
+
   /**
-   * Persist atomically: write a temp file, then rename over the target. An IO
-   * failure (disk full, permissions) must not throw into the caller — persist
-   * runs inside WebSocket event handlers, where an uncaught throw would take
-   * the relay down. The in-memory map stays authoritative and the next
-   * successful persist writes everything.
+   * Persist atomically and durably: write a temp file, fsync it, then rename
+   * over the target. An IO failure (disk full, permissions) must not throw into
+   * the caller — persist runs inside WebSocket event handlers, where an
+   * uncaught throw would take the relay down. The in-memory map stays
+   * authoritative and the next successful persist writes everything.
+   *
+   * Ownership changes (claim, release, ban, premium) hit the disk at once.
+   * Device-touch bookkeeping is `lazy`: coalesced for a moment so a reconnect
+   * storm does not rewrite the file per socket — it carries no ownership.
    */
-  private persist(): void {
+  private persist(lazy = false): void {
+    if (lazy) {
+      if (this.lazyTimer === null) this.lazyTimer = setTimeout(() => { this.lazyTimer = null; this.persist() }, LAZY_PERSIST_MS)
+      return
+    }
+    if (this.lazyTimer !== null) { clearTimeout(this.lazyTimer); this.lazyTimer = null }
     try {
       const body = JSON.stringify({ claims: Object.fromEntries(this.claims), banned: [...this.banned] })
       const tmp = `${this.path}.tmp`
-      writeFileSync(tmp, body, { mode: 0o600 })
+      const fd = openSync(tmp, 'w', 0o600)
+      try {
+        writeSync(fd, body)
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
       renameSync(tmp, this.path)
     } catch (err) {
       console.error(`dshn-relay: cannot persist claims to ${this.path}: ${(err as Error).message}`)
     }
+  }
+
+  /** Write any coalesced changes now (shutdown). */
+  flush(): void {
+    if (this.lazyTimer !== null) this.persist()
   }
 
   /**
@@ -127,18 +224,28 @@ export class ClaimStore {
    * @param now - current time in ms (the store never reads the clock itself).
    * @returns whether the agent may hold the subdomain.
    */
-  claimOrVerify(subdomain: string, password: string, now: number): ClaimResult {
-    if (!isValidSubdomainLabel(subdomain)) return { ok: false, claimed: false, reason: 'invalid or reserved subdomain' }
+  async claimOrVerify(subdomain: string, password: string, now: number): Promise<ClaimResult> {
+    if (typeof subdomain !== 'string' || !isValidSubdomainLabel(subdomain)) return { ok: false, claimed: false, reason: 'invalid or reserved subdomain' }
     if (this.banned.has(subdomain)) return { ok: false, claimed: false, reason: 'subdomain is banned' }
-    if (password.length < 8) return { ok: false, claimed: false, reason: 'password too short (min 8)' }
+    if (typeof password !== 'string' || password.length < 8) return { ok: false, claimed: false, reason: 'password too short (min 8)' }
+    if (password.length > MAX_PASSWORD_LENGTH) return { ok: false, claimed: false, reason: `password too long (max ${MAX_PASSWORD_LENGTH})` }
     const existing = this.claims.get(subdomain)
     if (existing === undefined) {
       const salt = randomBytes(16).toString('hex')
-      this.claims.set(subdomain, { hash: hashPassword(password, salt), salt, createdAt: now })
+      const hash = await hashPassword(password, salt)
+      // Re-check after the await: a concurrent HELLO may have claimed it first.
+      const race = this.claims.get(subdomain)
+      if (race !== undefined) {
+        return hexEqual(await hashPassword(password, race.salt), race.hash)
+          ? { ok: true, claimed: false }
+          : { ok: false, claimed: false, reason: 'wrong password for this subdomain' }
+      }
+      if (this.banned.has(subdomain)) return { ok: false, claimed: false, reason: 'subdomain is banned' }
+      this.claims.set(subdomain, { hash, salt, createdAt: now })
       this.persist()
       return { ok: true, claimed: true }
     }
-    if (hexEqual(hashPassword(password, existing.salt), existing.hash)) return { ok: true, claimed: false }
+    if (hexEqual(await hashPassword(password, existing.salt), existing.hash)) return { ok: true, claimed: false }
     return { ok: false, claimed: false, reason: 'wrong password for this subdomain' }
   }
 
@@ -150,15 +257,27 @@ export class ClaimStore {
    * @param password - the presented password.
    * @returns whether the password is correct for an existing claim.
    */
-  verifyLogin(subdomain: string, password: string): boolean {
+  async verifyLogin(subdomain: string, password: string): Promise<boolean> {
     const existing = this.claims.get(subdomain)
-    if (existing === undefined) return false
-    return hexEqual(hashPassword(password, existing.salt), existing.hash)
+    if (existing === undefined || typeof password !== 'string' || password.length > MAX_PASSWORD_LENGTH) return false
+    return hexEqual(await hashPassword(password, existing.salt), existing.hash)
   }
 
   /** Whether a subdomain has been claimed (an agent may be offline). */
   isClaimed(subdomain: string): boolean {
     return this.claims.has(subdomain)
+  }
+
+  /**
+   * The session version of a claim: what a browser session cookie is bound to.
+   * It changes whenever the claim is re-created (release/ban + re-claim), so
+   * every session minted for the previous owner stops verifying at once —
+   * a cookie is never a key to whoever holds the name next.
+   * @returns the version, or null when the name is not claimed (no session can be valid).
+   */
+  sessionVersionOf(subdomain: string): string | null {
+    const claim = this.claims.get(subdomain)
+    return claim === undefined ? null : `${claim.createdAt}.${claim.salt.slice(0, 8)}`
   }
 
   /**
@@ -180,7 +299,7 @@ export class ClaimStore {
       ids.sort((a, b) => devices[a].lastSeen - devices[b].lastSeen)
       for (const id of ids.slice(0, ids.length - MAX_DEVICES_PER_CLAIM)) delete devices[id]
     }
-    this.persist()
+    this.persist(true)
   }
 
   /** Known devices of a claim (connected or not), for the device picker. */

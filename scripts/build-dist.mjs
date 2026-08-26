@@ -4,7 +4,7 @@
 //   dist/relay/relay.mjs — the relay as one file (what gets deployed to a server)
 // Bundling frees `dsh plugin add` from resolving the file:../protocol workspace
 // link, and frees the relay host from needing any npm install.
-import { readdirSync, mkdirSync, copyFileSync, writeFileSync, rmSync } from 'node:fs'
+import { readdirSync, mkdirSync, copyFileSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
 
 const root = process.cwd()
 const ebDir = readdirSync('node_modules/.pnpm').find((d) => d.startsWith('esbuild@'))
@@ -35,7 +35,7 @@ copyFileSync('README.zh.md', 'dist/dshn/README.zh.md')
 copyFileSync('LICENSE', 'dist/dshn/LICENSE')
 writeFileSync('dist/dshn/package.json', JSON.stringify({
   name: '@dshn/agent',
-  version: '0.3.3',
+  version: JSON.parse(readFileSync('packages/agent/package.json', 'utf8')).version,
   description: 'Forward a local dsh web service to the public internet over ds.hn (bundled).',
   keywords: ['dsh', 'dsh-plugin', 'deepseek-harness', 'tunnel', 'forwarding', 'ds.hn'],
   license: 'MIT',
@@ -74,7 +74,7 @@ copyFileSync('SELF-HOSTING.md', 'dist/relay/README.md')
 copyFileSync('LICENSE', 'dist/relay/LICENSE')
 writeFileSync('dist/relay/package.json', JSON.stringify({
   name: '@dshn/relay',
-  version: '0.4.0',
+  version: JSON.parse(readFileSync('packages/relay/package.json', 'utf8')).version,
   description: 'Self-hostable ds.hn-style relay: a login-gated *.<apex> tunnel router that bridges public requests to dshn agents.',
   keywords: ['dsh', 'deepseek-harness', 'tunnel', 'relay', 'self-hosted', 'reverse-tunnel', 'ds.hn'],
   license: 'MIT',

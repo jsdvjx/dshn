@@ -22,6 +22,10 @@ function fakeCloudflare(seed: Rec[]): { dns: CloudflareDns; records: Rec[]; call
     const tail = url.pathname.replace(/^.*\/dns_records/, '')
     calls.push(`${method} ${tail}${url.search}`)
     if (method === 'GET') {
+      if (tail.startsWith('/')) {
+        const rec = records.find((r) => r.id === tail.slice(1))
+        return rec === undefined ? fail(81044, 'Record does not exist.', 404) : ok(rec)
+      }
       const name = url.searchParams.get('name')
       return ok(records.filter((r) => r.type === url.searchParams.get('type') && r.name === name))
     }
@@ -77,6 +81,28 @@ describe('CloudflareDns', () => {
     const cf = fakeCloudflare([{ id: 'theirs', type: 'A', name: NAME, content: '198.51.100.1', proxied: true, comment: 'set by hand' }])
     await expect(cf.dns.point(NAME, IP)).rejects.toThrow(/not managed by the relay/)
     expect(cf.records).toEqual([{ id: 'theirs', type: 'A', name: NAME, content: '198.51.100.1', proxied: true, comment: 'set by hand' }])
+  })
+
+  it('does not adopt a same-target record that lacks the relay comment', async () => {
+    const cf = fakeCloudflare([{ id: 'manual', type: 'A', name: NAME, content: IP, proxied: false }])
+    await expect(cf.dns.point(NAME, IP)).rejects.toThrow(/not managed by the relay/)
+    expect(cf.records).toHaveLength(1)
+    expect(cf.records[0].id).toBe('manual')
+    expect(cf.records[0].comment).toBeUndefined()
+  })
+
+  it('refuses to delete by a remembered id when that record is no longer ours', async () => {
+    // The relay's record was removed by hand and the operator later created
+    // their own; a stale id must not take theirs down.
+    const cf = fakeCloudflare([{ id: 'reused', type: 'A', name: NAME, content: '198.51.100.1', proxied: true, comment: 'set by hand' }])
+    await expect(cf.dns.unpoint(NAME, 'reused', IP)).rejects.toThrow(/not the relay's record/)
+    expect(cf.records).toHaveLength(1)
+  })
+
+  it('a stale id falls back to sweeping the name for records of ours', async () => {
+    const cf = fakeCloudflare([{ id: 'own2', type: 'A', name: NAME, content: IP, proxied: false, comment: COMMENT }])
+    await cf.dns.unpoint(NAME, 'long-gone', IP)
+    expect(cf.records).toHaveLength(0)
   })
 
   it('removes by id, and is a no-op when the record is already gone', async () => {

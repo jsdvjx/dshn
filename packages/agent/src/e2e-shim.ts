@@ -140,6 +140,28 @@ const SHIM_BODY = String.raw`
   }
   window.WebSocket = E2EWebSocket
 
+  // Fail closed for the clients this shim does not seal: an XMLHttpRequest or
+  // sendBeacon to /api would leave the page in plaintext (and the agent now
+  // refuses it with 428 anyway). Refuse here, loudly, so the failure is a
+  // clear error in the console rather than a silent plaintext leak.
+  const refuse = (what, url) => {
+    console.error('[dshn] end-to-end encryption is on: ' + what + ' to ' + url + ' is not sealed and was blocked; use fetch()')
+  }
+  if (typeof XMLHttpRequest !== 'undefined') {
+    const realOpen = XMLHttpRequest.prototype.open
+    XMLHttpRequest.prototype.open = function (method, url) {
+      if (isApi(String(url))) { refuse('XMLHttpRequest', String(url)); throw new DOMException('blocked by end-to-end encryption', 'SecurityError') }
+      return realOpen.apply(this, arguments)
+    }
+  }
+  if (navigator && typeof navigator.sendBeacon === 'function') {
+    const realBeacon = navigator.sendBeacon.bind(navigator)
+    navigator.sendBeacon = function (url, data) {
+      if (isApi(String(url))) { refuse('sendBeacon', String(url)); return false }
+      return realBeacon(url, data)
+    }
+  }
+
   // The host injected this script only because E2E is ON, with the public
   // salt and device id inline — so there is nothing to discover and no
   // window in which dsh's own traffic could slip past the gate: fetch and

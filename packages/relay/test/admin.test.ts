@@ -272,13 +272,13 @@ describe('admin panel', () => {
   it('persists bans across a store reload', async () => {
     const path = join(dir, 'claims-persist.json')
     const store = new ClaimStore(path)
-    expect(store.claimOrVerify('gone', 'some-password', Date.now()).ok).toBe(true)
+    expect((await store.claimOrVerify('gone', 'some-password', Date.now())).ok).toBe(true)
     store.ban('gone')
     const reloaded = ClaimStore.fromFile(path)
-    expect(reloaded.claimOrVerify('gone', 'some-password', Date.now()).ok).toBe(false)
+    expect((await reloaded.claimOrVerify('gone', 'some-password', Date.now())).ok).toBe(false)
     expect(reloaded.listBanned()).toContain('gone')
     reloaded.unban('gone')
-    expect(reloaded.claimOrVerify('gone', 'some-password', Date.now()).ok).toBe(true)
+    expect((await reloaded.claimOrVerify('gone', 'some-password', Date.now())).ok).toBe(true)
   })
 
   it('serves trend history: a sample taken at start, cumulative columns', async () => {

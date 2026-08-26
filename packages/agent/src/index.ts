@@ -264,6 +264,12 @@ const ROUTE_FALLBACK_MS = 5 * 60_000
 const ROUTE_FALLBACK_MAX_MS = 60 * 60_000
 /** How long a probe of the premium host waits for the WebSocket handshake. */
 const ROUTE_PROBE_TIMEOUT_MS = 10_000
+/** Largest single frame accepted from the relay (a sealed /api response is one frame). */
+const MAX_FRAME_BYTES = 128 * 1024 * 1024
+/** Control-socket bytes queued above which sources feeding it are paused. */
+const SEND_HIGH_WATER = 8 * 1024 * 1024
+/** Queued bytes above which a source that cannot be paused (an event socket) is dropped. */
+const MAX_BUFFERED = 64 * 1024 * 1024
 
 /**
  * A relay-supplied route host must be a plain authority (`host[:port]`) or a
@@ -463,9 +469,13 @@ export class AgentTunnel {
     this.status.configured = true
     this.status.subdomain = label
     this.status.lastError = null
-    // Drop any existing socket and connect fresh with the new credentials.
-    this.control?.close()
+    // Drop any existing socket — and every stream bridged over it, since the
+    // next connection numbers its streams from 1 again — and connect fresh
+    // with the new credentials.
+    const old = this.control
     this.control = null
+    this.dropStreams()
+    old?.close()
     this.backoffMs = 1_000
     this.connect()
     return null
@@ -489,6 +499,11 @@ export class AgentTunnel {
     this.creds = { ...this.creds, e2ePassword: next, e2eSalt: changed ? undefined : this.creds.e2eSalt }
     this.refreshE2E()
     this.saveCreds(this.creds)
+    // Streams in flight were sealed (or not) under the previous key: a response
+    // half-sealed with an old key, or an event socket still sealing with it,
+    // would be garbage to the browser. Fail them; browsers reconnect and the
+    // new shell they load carries the new salt.
+    if (changed) this.dropStreams()
     return null
   }
 
@@ -517,12 +532,26 @@ export class AgentTunnel {
     return typeof c === 'string' && c !== '' ? c : this.config.relayHost
   }
 
-  /** The origin CA to pin, as PEM bytes: inline PEM from the UI, or an env-configured file path. */
+  /**
+   * The origin CA to pin, as PEM bytes: inline PEM from the UI, or an
+   * env-configured file path. A configured file that cannot be read THROWS —
+   * silently falling back to the system CAs would turn a pinned, self-signed
+   * relay into "any certificate the network offers".
+   */
   private effectiveOriginCa(): Buffer | null {
     const raw = (this.creds?.originCa && this.creds.originCa !== '') ? this.creds.originCa : this.config.originCa
     if (raw === '' || raw === undefined) return null
     if (raw.includes('BEGIN CERTIFICATE')) return Buffer.from(raw) // inline PEM pasted in the UI
-    try { return readFileSync(raw) } catch { return null } // a file path (env DSHN_ORIGIN_CA)
+    try {
+      return readFileSync(raw) // a file path (env DSHN_ORIGIN_CA)
+    } catch (err) {
+      throw new Error(`cannot read the relay CA file ${raw}: ${(err as Error).message}`)
+    }
+  }
+
+  /** Whether the CA setting is usable (or absent) — the panel's "direct" flag must not throw. */
+  private hasOriginCa(): boolean {
+    try { return this.effectiveOriginCa() !== null } catch { return true }
   }
 
   /** The raw self-hosted overrides, for the settings UI to pre-fill (loopback callers only). */
@@ -533,7 +562,7 @@ export class AgentTunnel {
   /** Connection details for the local panel (relay, mode, uptime, latency, throughput). */
   info(): { relayHost: string; direct: boolean; route: TunnelRoute | null; routeHost: string | null; connectedSince: number | null; served: number; localPort: number; latencyMs: number | null } {
     const host = this.effectiveRelayHost()
-    const direct = /^wss?:\/\//.test(host) || this.effectiveOriginCa() !== null
+    const direct = /^wss?:\/\//.test(host) || this.hasOriginCa()
     // Once connected, report the authority actually in use (the premium host
     // when on that route), not just the configured default.
     const live = this.status.connected && this.dialledHost !== null ? this.dialledHost : host
@@ -562,8 +591,10 @@ export class AgentTunnel {
     this.routeFallbackUntil = 0
     this.routeFallbackMs = ROUTE_FALLBACK_MS
     if (this.reconnectTimer !== null) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
-    this.control?.close()
+    const old = this.control
     this.control = null
+    this.dropStreams()
+    old?.close()
   }
 
   start(): void {
@@ -759,13 +790,33 @@ export class AgentTunnel {
     const relayHost = this.dialHost()
     const base = relayHost.includes('://') ? relayHost : `wss://${relayHost}`
     this.dialledHost = relayHost
-    const wsOpts: Record<string, unknown> = { maxPayload: 512 * 1024 * 1024 }
+    const wsOpts: Record<string, unknown> = { maxPayload: MAX_FRAME_BYTES }
+    // Refuse to dial rather than dial insecurely: a plain ws:// authority is
+    // only for a relay on this machine (tests, a local self-host), and a pinned
+    // CA that cannot be read must not degrade to the system trust store.
+    const dialProblem = (why: string): void => {
+      this.status.lastError = why
+      this.dialledHost = null
+      if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = setTimeout(() => this.connect(), this.backoffMs)
+      this.backoffMs = Math.min(this.backoffMs * 2, 30_000)
+    }
+    if (base.startsWith('ws://')) {
+      let hostname = ''
+      try { hostname = new URL(base).hostname } catch { /* fall through to the refusal */ }
+      if (!isLoopbackAddress(hostname) && hostname !== 'localhost') return dialProblem(`refusing plain ws:// to ${hostname || base}: use wss:// (ws:// is allowed to loopback only)`)
+    }
     // Pin a self-signed relay's cert (as the sole CA) so validation stays strict
     // without a public CA. Also used for a direct off-Cloudflare origin. The PEM
     // is either pasted inline in the UI or an env-configured file path. It pins
     // the DEFAULT relay only: a premium host is a separate edge with its own
     // (publicly trusted) certificate, which the pinned CA would always reject.
-    const ca = this.effectiveOriginCa()
+    let ca: Buffer | null
+    try {
+      ca = this.effectiveOriginCa()
+    } catch (err) {
+      return dialProblem((err as Error).message)
+    }
     if (ca !== null && relayHost === this.effectiveRelayHost()) wsOpts.ca = ca
     const ws = new WebSocket(`${base}${AGENT_WS_PATH}`, wsOpts)
     this.control = ws
@@ -857,8 +908,17 @@ export class AgentTunnel {
     if (this.control?.readyState === WebSocket.OPEN) this.control.send(encodeControl(frame))
   }
 
-  private sendData(kind: 1 | 2 | 3 | 4, id: number, payload: Uint8Array): void {
-    if (this.control?.readyState === WebSocket.OPEN) this.control.send(encodeData(kind, id, payload))
+  /**
+   * Send a data frame. Returns false when the control socket already holds
+   * more than the high-water mark: the caller should pause its source and
+   * resume it from `flushed`, which fires once this frame has been written.
+   */
+  private sendData(kind: 1 | 2 | 3 | 4, id: number, payload: Uint8Array, flushed?: () => void): boolean {
+    const ws = this.control
+    if (ws?.readyState !== WebSocket.OPEN) return true
+    const over = ws.bufferedAmount > SEND_HIGH_WATER
+    ws.send(encodeData(kind, id, payload), over && flushed !== undefined ? () => flushed() : undefined)
+    return !over
   }
 
   private onMessage(data: RawData, isBinary: boolean): void {
@@ -1012,8 +1072,20 @@ export class AgentTunnel {
     // is sealed — the app shell and plugin bundles must stay plaintext so the
     // browser can bootstrap the very code that does the decryption.
     if (this.e2eKey !== null && bare.startsWith('/api')) {
-      outHeaders['accept-encoding'] = 'identity' // seal plaintext, not gzip/br
       const marked = headers.some(([k]) => k.toLowerCase() === E2E_HEADER)
+      if (!marked) {
+        // Fail closed: with E2E on, an /api request that did not come through
+        // the shim (XHR, sendBeacon, a client that lost the bootstrap) would
+        // reach dsh in plaintext and get plaintext back over the relay. Refuse
+        // it with a reason instead of quietly forwarding it unsealed.
+        this.send({ t: 'res_head', id, status: 428, headers: [['content-type', 'application/json'], ['cache-control', 'no-store']] })
+        this.sendData(DATA_RES_BODY, id, Buffer.from(JSON.stringify({ error: 'end-to-end encryption is on: /api requests must be sealed by the page (reload the page)' })))
+        this.send({ t: 'res_end', id })
+        return
+      }
+      outHeaders['accept-encoding'] = 'identity' // seal plaintext, not gzip/br
+      delete outHeaders['if-none-match'] // a 304 has no body to seal; always answer in full
+      delete outHeaders['if-modified-since']
       this.reqE2E.set(id, { method, path, headers: outHeaders, marked, chunks: [] })
       return
     }
@@ -1028,7 +1100,13 @@ export class AgentTunnel {
     //    arrives too late for those).
     const wantsDocument = method === 'GET'
       && headers.some(([k, v]) => k.toLowerCase() === 'accept' && v.includes('text/html'))
-    if (wantsDocument) outHeaders['accept-encoding'] = 'identity' // we need the plaintext to edit it
+    if (wantsDocument) {
+      outHeaders['accept-encoding'] = 'identity' // we need the plaintext to edit it
+      // A conditional navigation could be answered 304 — a stale shell out of
+      // the browser cache, minus today's rewrite (and the E2E bootstrap).
+      delete outHeaders['if-none-match']
+      delete outHeaders['if-modified-since']
+    }
 
     const req = http.request(
       { host: this.config.localHost, port: this.localPort(), method, path, headers: outHeaders },
@@ -1041,9 +1119,11 @@ export class AgentTunnel {
             let html = credentialManifestLinks(Buffer.concat(chunks).toString('utf8'))
             if (this.e2eKey !== null) html = injectE2EBootstrap(html, { salt: this.e2eSalt, device: this.deviceId })
             const body = Buffer.from(html, 'utf8')
+            // The document was transformed: its validators no longer describe
+            // it, and it must not be served from cache without this pass.
             const resHeaders = filterHeaders(headerListFromRaw(res.rawHeaders),
-              new Set([...HOP_BY_HOP, 'content-length', 'content-encoding']))
-            resHeaders.push(['content-length', String(body.length)])
+              new Set([...HOP_BY_HOP, 'content-length', 'content-encoding', 'etag', 'last-modified', 'cache-control', 'expires']))
+            resHeaders.push(['content-length', String(body.length)], ['cache-control', 'no-store'])
             this.send({ t: 'res_head', id, status: 200, headers: resHeaders })
             this.sendData(DATA_RES_BODY, id, body)
             this.send({ t: 'res_end', id })
@@ -1057,7 +1137,11 @@ export class AgentTunnel {
           status: res.statusCode ?? 502,
           headers: filterHeaders(headerListFromRaw(res.rawHeaders)),
         })
-        res.on('data', (chunk: Buffer) => this.sendData(DATA_RES_BODY, id, chunk))
+        // Backpressure: when the control socket is backed up, stop reading from
+        // dsh until the frame carrying this chunk has been written out.
+        res.on('data', (chunk: Buffer) => {
+          if (!this.sendData(DATA_RES_BODY, id, chunk, () => res.resume())) res.pause()
+        })
         res.on('end', () => this.send({ t: 'res_end', id }))
         res.on('error', () => this.send({ t: 'abort', id, reason: 'response stream error' }))
       },
@@ -1103,9 +1187,11 @@ export class AgentTunnel {
         res.on('end', () => {
           const sealed = e2eSeal(this.e2eKey as Buffer, Buffer.concat(chunks))
           // Drop length/encoding of the plaintext; the sealed blob has its own.
+          // Drop the validators too: a revalidated cache hit would hand the
+          // browser a sealed body it must not treat as the same resource.
           const resHeaders = filterHeaders(headerListFromRaw(res.rawHeaders),
-            new Set([...HOP_BY_HOP, 'content-length', 'content-encoding']))
-          resHeaders.push([E2E_HEADER, '1'], ['content-length', String(sealed.length)])
+            new Set([...HOP_BY_HOP, 'content-length', 'content-encoding', 'etag', 'last-modified', 'cache-control', 'expires']))
+          resHeaders.push([E2E_HEADER, '1'], ['content-length', String(sealed.length)], ['cache-control', 'no-store'])
           this.send({ t: 'res_head', id, status: res.statusCode ?? 502, headers: resHeaders })
           this.sendData(DATA_RES_BODY, id, sealed)
           this.send({ t: 'res_end', id })
@@ -1142,6 +1228,15 @@ export class AgentTunnel {
     sock.on('open', () => this.send({ t: 'ws_ready', id }))
     sock.on('message', (data: RawData, isBinary: boolean) => {
       const raw = toBuf(data)
+      // An event socket cannot be paused; if the uplink is this far behind,
+      // drop the socket rather than queue without bound (the browser reconnects).
+      if (this.control !== null && this.control.bufferedAmount > MAX_BUFFERED) {
+        if (this.sockets.delete(id)) {
+          sock.close(1013, 'uplink congested')
+          this.send({ t: 'ws_close', id, code: 1013, reason: 'uplink congested' })
+        }
+        return
+      }
       if (sealMessages && this.e2eKey !== null) {
         const typed = Buffer.concat([Buffer.from([isBinary ? E2E_MSG_BINARY : E2E_MSG_TEXT]), raw])
         this.sendData(DATA_WS_BINARY, id, e2eSeal(this.e2eKey, typed))
@@ -1195,6 +1290,13 @@ export function targetsManagementRoute(rawPath: string): boolean {
   return norm === '/dshn' || norm.startsWith('/dshn/')
 }
 
+/** Whether an address is the local host itself (IPv4 loopback net, IPv6 ::1, or the mapped form). */
+export function isLoopbackAddress(addr: string | undefined): boolean {
+  if (addr === undefined || addr === '') return false
+  const a = addr.toLowerCase().replace(/^::ffff:/, '')
+  return a === '::1' || a.startsWith('127.')
+}
+
 export function isLoopbackRequest(req: http.IncomingMessage): boolean {
   // A request the agent itself replayed from the tunnel is NEVER local — however
   // its Host was rewritten to loopback and however dsh normalized its path. This
@@ -1202,6 +1304,10 @@ export function isLoopbackRequest(req: http.IncomingMessage): boolean {
   // for the password-revealing management routes; the Host check below alone is
   // not, because replayed requests all carry a loopback Host.
   if (req.headers[TUNNEL_MARKER] !== undefined) return false
+  // The connection itself must come from this machine: a Host header is whatever
+  // the client chose to send, and `Host: localhost` from a LAN address must not
+  // open the password-revealing routes. No socket address = not local.
+  if (!isLoopbackAddress(req.socket?.remoteAddress)) return false
   const host = String(req.headers.host ?? '')
   // Strip the port and any IPv6 brackets, then match the loopback hostnames.
   const hostname = host.replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase()

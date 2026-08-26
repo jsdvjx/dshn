@@ -41,6 +41,7 @@ import {
 } from '@dshn/protocol'
 import { ClaimStore, type PremiumRecord } from './claims.js'
 import type { PremiumDns } from './dns.js'
+import { DSHN_PROTOCOL_VERSION, isValidSubdomainLabel, type HelloFrame } from '@dshn/protocol'
 import {
   COOKIE_NAME, DEVICE_COOKIE, constantTimeEqual, cookieHeader, deviceCookieHeader, devicesPage, loginPage,
   parseCookies, sign, verify, type PickerDevice,
@@ -85,6 +86,10 @@ export interface RelayOptions {
    * not exist on this relay (agents are told nothing about routes).
    */
   premium?: PremiumOptions
+  /** How long an agent socket may sit without a HELLO before it is dropped (tests shorten it). */
+  helloTimeoutMs?: number
+  /** HELLOs accepted per client IP per minute (tests raise it; the peer gate is 10× this). */
+  helloPerMinute?: number
 }
 
 /** Premium-route wiring, all operator-supplied. */
@@ -147,6 +152,32 @@ const HISTORY_MAX = 2880
 const LOGIN_FAIL_MAX = 8
 const LOGIN_FAIL_WINDOW_MS = 15 * 60 * 1000
 const LOGIN_LOCKOUT_MS = 10 * 60 * 1000
+/**
+ * A second, looser gate keyed on the SOCKET peer. The primary key is the
+ * client IP a proxy reports, which a direct-to-origin client can forge per
+ * request; the peer address cannot be forged, but behind Cloudflare it is
+ * shared by many visitors — hence the higher threshold.
+ */
+const LOGIN_PEER_FAIL_MAX = 64
+
+/** Agent handshake: a socket that has not said HELLO by then is dropped. */
+const HELLO_TIMEOUT_MS = 10_000
+/**
+ * HELLOs accepted per client IP per minute (agents reconnect with backoff;
+ * this is far above honest use). The socket-peer gate is 10× looser, since a
+ * Cloudflare egress address is shared by many agents.
+ */
+const HELLO_PER_MINUTE = 60
+/** Sockets one peer may hold open before HELLO at once. */
+const PRE_HELLO_PER_PEER = 32
+/** Largest single WebSocket frame accepted from an agent or a browser. */
+export const MAX_FRAME_BYTES = 128 * 1024 * 1024
+/** Buffered bytes on a socket above which the source feeding it is paused. */
+const SEND_HIGH_WATER = 8 * 1024 * 1024
+/** Buffered bytes above which a consumer that cannot be paused is dropped as too slow. */
+const MAX_BUFFERED = 64 * 1024 * 1024
+/** A public response with no bytes from the agent for this long is failed. */
+const STREAM_IDLE_MS = 120_000
 
 /** Coerce a `ws` message payload to a single Buffer. */
 function toBuf(data: RawData): Buffer {
@@ -180,6 +211,8 @@ class AgentConnection {
   readonly connectedAt = Date.now()
   readonly responses = new Map<number, http.ServerResponse>()
   readonly sockets = new Map<number, WebSocket>()
+  /** Last time the agent sent anything for a pending response, by stream id (idle timeout). */
+  readonly activity = new Map<number, number>()
 
   constructor(readonly subdomain: string, readonly deviceId: string, readonly deviceName: string, readonly ws: WebSocket) {}
 
@@ -194,8 +227,69 @@ class AgentConnection {
     if (this.ws.readyState === WebSocket.OPEN) this.ws.send(encodeControl(frame))
   }
 
-  sendData(kind: DataKind, id: number, payload: Uint8Array): void {
-    if (this.ws.readyState === WebSocket.OPEN) this.ws.send(encodeData(kind, id, payload))
+  /**
+   * Send a data frame. When the socket already holds more than the high-water
+   * mark, the caller's source should stop until `flushed` fires — that is how
+   * a fast public client is kept from ballooning the relay's memory.
+   * @returns false when the caller should pause its source.
+   */
+  sendData(kind: DataKind, id: number, payload: Uint8Array, flushed?: () => void): boolean {
+    if (this.ws.readyState !== WebSocket.OPEN) return true
+    const over = this.ws.bufferedAmount > SEND_HIGH_WATER
+    this.ws.send(encodeData(kind, id, payload), over && flushed !== undefined ? () => flushed() : undefined)
+    return !over
+  }
+}
+
+/**
+ * Validate an agent's first frame. Only the shape is checked here (types,
+ * lengths, protocol version); the claim store decides ownership. Anything off
+ * is a reason string, never a throw — the frame came from the network.
+ */
+function checkHello(frame: unknown): HelloFrame | string {
+  if (frame === null || typeof frame !== 'object') return 'malformed hello'
+  const f = frame as Record<string, unknown>
+  if (f.t !== 'hello') return 'expected hello'
+  if (typeof f.protocol !== 'number' || !Number.isInteger(f.protocol)) return 'malformed hello: protocol'
+  if (f.protocol !== DSHN_PROTOCOL_VERSION) return `unsupported protocol version ${f.protocol} (relay speaks ${DSHN_PROTOCOL_VERSION})`
+  if (typeof f.subdomain !== 'string' || f.subdomain.length > 64 || !isValidSubdomainLabel(f.subdomain)) return 'invalid or reserved subdomain'
+  if (typeof f.password !== 'string') return 'malformed hello: password'
+  if (f.password.length < 8) return 'password too short (min 8)'
+  if (f.password.length > 256) return 'password too long (max 256)'
+  if (f.agent !== undefined && (typeof f.agent !== 'string' || f.agent.length > 128)) return 'malformed hello: agent'
+  if (f.deviceId !== undefined && (typeof f.deviceId !== 'string' || f.deviceId.length > 128)) return 'malformed hello: deviceId'
+  if (f.device !== undefined && (typeof f.device !== 'string' || f.device.length > 256)) return 'malformed hello: device'
+  return {
+    t: 'hello',
+    subdomain: f.subdomain,
+    password: f.password,
+    agent: typeof f.agent === 'string' ? f.agent : '',
+    protocol: f.protocol,
+    ...(typeof f.deviceId === 'string' ? { deviceId: f.deviceId } : {}),
+    ...(typeof f.device === 'string' ? { device: f.device } : {}),
+  }
+}
+
+/** A sliding one-minute counter per key, for the HELLO rate gates. */
+class MinuteGate {
+  private readonly counts = new Map<string, { n: number; since: number }>()
+
+  constructor(private readonly max: number) {}
+
+  /** Count one event; false when the key is over its budget for this minute. */
+  admit(key: string, now: number): boolean {
+    const c = this.counts.get(key)
+    if (c === undefined || now - c.since >= 60_000) {
+      this.counts.set(key, { n: 1, since: now })
+      return true
+    }
+    c.n += 1
+    return c.n <= this.max
+  }
+
+  /** Drop keys whose minute has passed. */
+  prune(now: number): void {
+    for (const [key, c] of this.counts) if (now - c.since >= 60_000) this.counts.delete(key)
   }
 }
 
@@ -251,6 +345,13 @@ export class RelayServer {
   private readonly agents = new Map<string, Map<string, AgentConnection>>()
   /** Per-subdomain login failure tracking for the brute-force lockout. */
   private readonly loginGate = new Map<string, { count: number; last: number; until: number }>()
+  /** HELLO rate gates: by reported client IP, and by socket peer. */
+  private readonly helloGate: MinuteGate
+  private readonly helloPeerGate: MinuteGate
+  /** Sockets per peer that are open but have not completed HELLO. */
+  private readonly preHello = new Map<string, number>()
+  /** Per-subdomain premium/DNS operation chains, so enable/disable/release never interleave. */
+  private readonly premiumOps = new Map<string, Promise<unknown>>()
   private heartbeat: ReturnType<typeof setInterval> | null = null
   /** When this relay process started, for the admin panel's uptime. */
   private readonly startedAt = Date.now()
@@ -270,7 +371,10 @@ export class RelayServer {
       ? https.createServer({ cert: opts.tls.cert, key: opts.tls.key }, handler)
       : http.createServer(handler)
     this.http.on('upgrade', (req, socket, head) => this.onUpgrade(req, socket, head))
-    this.wss = new WebSocketServer({ noServer: true })
+    this.wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES })
+    const perMinute = opts.helloPerMinute ?? HELLO_PER_MINUTE
+    this.helloGate = new MinuteGate(perMinute)
+    this.helloPeerGate = new MinuteGate(perMinute * 10)
   }
 
   /**
@@ -300,6 +404,7 @@ export class RelayServer {
     this.wss.close()
     this.http.close()
     this.http.closeAllConnections()
+    this.opts.claims.flush()
   }
 
   /** Drop agents that have gone silent past the timeout, and ping the rest. */
@@ -310,7 +415,22 @@ export class RelayServer {
         if (now - conn.lastPong > HEARTBEAT_TIMEOUT_MS) {
           if (process.env.DSHN_DEBUG) console.error(`[relay] heartbeat timeout for "${conn.subdomain}"/${conn.deviceId} (silent ${now - conn.lastPong}ms) — terminating`)
           conn.ws.terminate()
-        } else conn.send({ t: 'ping' })
+          continue
+        }
+        conn.send({ t: 'ping' })
+        // A pending response the agent has gone quiet on is failed, so a stuck
+        // origin cannot pin public sockets (and the relay's memory) forever.
+        for (const [id, last] of conn.activity) {
+          if (now - last <= STREAM_IDLE_MS) continue
+          const res = conn.responses.get(id)
+          conn.responses.delete(id)
+          conn.activity.delete(id)
+          if (res !== undefined) {
+            if (!res.headersSent) res.writeHead(504, { 'content-type': 'text/plain' })
+            res.end('Tunnel timeout.\n')
+          }
+          conn.send({ t: 'abort', id, reason: 'idle timeout' })
+        }
       }
     }
     // Drop stale login-gate entries (lock expired and no recent failures) so the
@@ -318,6 +438,8 @@ export class RelayServer {
     for (const [key, g] of this.loginGate) {
       if (g.until <= now && now - g.last > LOGIN_FAIL_WINDOW_MS) this.loginGate.delete(key)
     }
+    this.helloGate.prune(now)
+    this.helloPeerGate.prune(now)
   }
 
   // ── public HTTP ───────────────────────────────────────────────────────────
@@ -343,7 +465,7 @@ export class RelayServer {
     if (url === '/__dshn/login' && req.method === 'POST') return this.handleLogin(req, res, sub)
 
     const cookies = parseCookies(req.headers.cookie)
-    if (!verify(this.opts.cookieSecret, sub, cookies[COOKIE_NAME] ?? '')) {
+    if (!verify(this.opts.cookieSecret, sub, cookies[COOKIE_NAME] ?? '', this.opts.claims.sessionVersionOf(sub))) {
       return this.serveLogin(res, `${sub}.${this.opts.apex}`, false, 200)
     }
 
@@ -362,23 +484,34 @@ export class RelayServer {
     const traffic = this.trafficOf(sub)
     traffic.requests++
     conn.responses.set(id, res)
+    conn.activity.set(id, Date.now())
     conn.send({ t: 'req_head', id, method: req.method ?? 'GET', path: url, headers: headerList(req.rawHeaders) })
-    req.on('data', (chunk: Buffer) => { traffic.bytesIn += chunk.length; conn.sendData(DATA_REQ_BODY, id, chunk) })
+    req.on('data', (chunk: Buffer) => {
+      traffic.bytesIn += chunk.length
+      // Backpressure: a fast uploader waits for the agent socket to drain.
+      if (!conn.sendData(DATA_REQ_BODY, id, chunk, () => req.resume())) req.pause()
+    })
     req.on('end', () => conn.send({ t: 'req_end', id }))
     req.on('error', () => conn.send({ t: 'abort', id, reason: 'request stream error' }))
     res.on('close', () => {
+      conn.activity.delete(id)
       if (conn.responses.delete(id)) conn.send({ t: 'abort', id, reason: 'client closed' })
     })
   }
 
   /**
-   * The rate-limit key: the real client IP (Cloudflare passes it as
-   * `cf-connecting-ip`; the socket peer is CF's shared address, useless as a
-   * key) plus the subdomain. Keying on the IP means a wrong-guess flood locks
-   * out only the attacker, not the legitimate owner of the subdomain.
+   * The rate-limit keys: the real client IP (Cloudflare passes it as
+   * `cf-connecting-ip`; the socket peer is CF's shared address, useless alone)
+   * plus the subdomain — so a wrong-guess flood locks out only the attacker,
+   * not the legitimate owner — AND the socket peer with a looser budget, so a
+   * direct-to-origin client forging a fresh client IP per guess still runs
+   * into a wall.
    */
-  private loginKey(req: http.IncomingMessage, sub: string): string {
-    return `${sub}|${this.clientIp(req)}`
+  private loginKeys(req: http.IncomingMessage, sub: string): Array<{ key: string; max: number }> {
+    return [
+      { key: `${sub}|${this.clientIp(req)}`, max: LOGIN_FAIL_MAX },
+      { key: `${sub}|peer|${this.peerIp(req)}`, max: LOGIN_PEER_FAIL_MAX },
+    ]
   }
 
   /** The peer address of a request, IPv4-mapped forms normalized (`::ffff:1.2.3.4` → `1.2.3.4`). */
@@ -412,14 +545,16 @@ export class RelayServer {
 
   private handleLogin(req: http.IncomingMessage, res: http.ServerResponse, sub: string): void {
     const now = Date.now()
-    const key = this.loginKey(req, sub)
-    const gate = this.loginGate.get(key)
-    if (gate !== undefined && gate.until > now) {
-      // Locked out after too many wrong guesses — the password guards a shell.
-      const secs = Math.ceil((gate.until - now) / 1000)
-      res.writeHead(429, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': String(secs), 'cache-control': 'no-store' })
-      res.end(`Too many attempts. Try again in ${secs}s.\n`)
-      return
+    const keys = this.loginKeys(req, sub)
+    for (const { key } of keys) {
+      const gate = this.loginGate.get(key)
+      if (gate !== undefined && gate.until > now) {
+        // Locked out after too many wrong guesses — the password guards a shell.
+        const secs = Math.ceil((gate.until - now) / 1000)
+        res.writeHead(429, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': String(secs), 'cache-control': 'no-store' })
+        res.end(`Too many attempts. Try again in ${secs}s.\n`)
+        return
+      }
     }
     let body = ''
     let over = false
@@ -435,26 +570,28 @@ export class RelayServer {
       const params = new URLSearchParams(body)
       const password = params.get('password') ?? ''
       const host = `${sub}.${this.opts.apex}`
-      if (this.opts.claims.verifyLogin(sub, password)) {
-        this.loginGate.delete(key)
-        res.writeHead(302, {
-          'set-cookie': cookieHeader(sign(this.opts.cookieSecret, sub)),
-          location: '/',
-        })
-        res.end()
-      } else {
-        this.registerLoginFailure(key, now)
-        this.serveLogin(res, host, true, 401)
-      }
+      void this.opts.claims.verifyLogin(sub, password).then((ok) => {
+        if (ok) {
+          for (const { key } of keys) this.loginGate.delete(key)
+          res.writeHead(302, {
+            'set-cookie': cookieHeader(sign(this.opts.cookieSecret, sub, undefined, this.opts.claims.sessionVersionOf(sub) ?? '')),
+            location: '/',
+          })
+          res.end()
+        } else {
+          for (const { key, max } of keys) this.registerLoginFailure(key, max, now)
+          this.serveLogin(res, host, true, 401)
+        }
+      }, () => this.fail(res, 500, 'Login failed'))
     })
   }
 
-  /** Count a wrong password and lock the (subdomain, IP) out after a burst. */
-  private registerLoginFailure(key: string, now: number): void {
+  /** Count a wrong password and lock the key out after a burst. */
+  private registerLoginFailure(key: string, max: number, now: number): void {
     const g = this.loginGate.get(key)
     // Reset the counter if the last failure was long ago (a slow, honest retry).
     const fails = g !== undefined && now - g.last < LOGIN_FAIL_WINDOW_MS ? g.count + 1 : 1
-    const until = fails >= LOGIN_FAIL_MAX ? now + LOGIN_LOCKOUT_MS : 0
+    const until = fails >= max ? now + LOGIN_LOCKOUT_MS : 0
     this.loginGate.set(key, { count: fails, last: now, until })
   }
 
@@ -681,11 +818,27 @@ export class RelayServer {
       if (typeof sub !== 'string' || sub === '' || sub.length > 64 || typeof enabled !== 'boolean') {
         return this.json(res, 400, { error: 'expected { subdomain, enabled }' })
       }
-      void this.setPremiumRoute(sub, enabled).then(
+      void this.premiumSerial(sub, () => this.setPremiumRoute(sub, enabled)).then(
         (result) => this.json(res, result.status, result.body),
         (err: unknown) => this.json(res, 500, { error: (err as Error).message }),
       )
     })
+  }
+
+  /**
+   * Run one premium/DNS operation for a subdomain after every earlier one for
+   * that subdomain has settled. Enable, disable and the DNS removal on
+   * release/ban all go through here, so two operators clicking at once — or
+   * a release racing an enable — resolve in order instead of interleaving
+   * their DNS calls and claim writes.
+   */
+  private premiumSerial<T>(sub: string, op: () => Promise<T>): Promise<T> {
+    const prev = this.premiumOps.get(sub) ?? Promise.resolve()
+    const run = prev.then(op, op)
+    const settled = run.then(() => undefined, () => undefined)
+    this.premiumOps.set(sub, settled)
+    void settled.then(() => { if (this.premiumOps.get(sub) === settled) this.premiumOps.delete(sub) })
+    return run
   }
 
   /** The premium toggle proper; see {@link handleAdminPremium}. */
@@ -741,7 +894,8 @@ export class RelayServer {
     const p = this.opts.premium
     const premium = this.opts.claims.premiumOf(sub)
     if (p?.dns === undefined || premium === null) return
-    void p.dns.unpoint(this.hostnameOf(sub), premium.dns?.id, p.host).catch((err: unknown) => {
+    const dns = p.dns
+    void this.premiumSerial(sub, () => dns.unpoint(this.hostnameOf(sub), premium.dns?.id, p.host)).catch((err: unknown) => {
       console.error(`dshn-relay: cannot remove the premium DNS record of "${sub}": ${(err as Error).message}`)
     })
   }
@@ -749,26 +903,28 @@ export class RelayServer {
   /** Admin login POST: same brute-force gate as tunnel logins, keyed under the admin scope. */
   private handleAdminLogin(req: http.IncomingMessage, res: http.ServerResponse, pw: string): void {
     const now = Date.now()
-    const key = this.loginKey(req, ADMIN_SCOPE)
-    const gate = this.loginGate.get(key)
-    if (gate !== undefined && gate.until > now) {
-      const secs = Math.ceil((gate.until - now) / 1000)
-      res.writeHead(429, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': String(secs), 'cache-control': 'no-store' })
-      res.end(`Too many attempts. Try again in ${secs}s.\n`)
-      return
+    const keys = this.loginKeys(req, ADMIN_SCOPE)
+    for (const { key } of keys) {
+      const gate = this.loginGate.get(key)
+      if (gate !== undefined && gate.until > now) {
+        const secs = Math.ceil((gate.until - now) / 1000)
+        res.writeHead(429, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': String(secs), 'cache-control': 'no-store' })
+        res.end(`Too many attempts. Try again in ${secs}s.\n`)
+        return
+      }
     }
     this.readSmallBody(req, (body) => {
       if (body === null) return
       const password = new URLSearchParams(body).get('password') ?? ''
       if (password !== '' && constantTimeEqual(password, pw)) {
-        this.loginGate.delete(key)
+        for (const { key } of keys) this.loginGate.delete(key)
         res.writeHead(302, {
           'set-cookie': adminCookieHeader(sign(this.opts.cookieSecret, ADMIN_SCOPE, ADMIN_MAX_AGE_S)),
           location: '/__admin',
         })
         res.end()
       } else {
-        this.registerLoginFailure(key, now)
+        for (const { key, max } of keys) this.registerLoginFailure(key, max, now)
         res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
         res.end(adminLoginPage(this.opts.apex, true))
       }
@@ -959,12 +1115,24 @@ export class RelayServer {
   private onUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer): void {
     const path = (req.url ?? '/').split('?', 1)[0]
     if (path === AGENT_WS_PATH) {
-      this.wss.handleUpgrade(req, socket, head, (ws) => this.registerAgent(ws))
+      // Handshake budget, before any WebSocket state exists for the peer: a
+      // bounded number of not-yet-authenticated sockets per peer, and a
+      // per-minute HELLO rate by reported client IP and by peer.
+      const peer = this.peerIp(req)
+      const now = Date.now()
+      const open = this.preHello.get(peer) ?? 0
+      if (open >= PRE_HELLO_PER_PEER || !this.helloGate.admit(this.clientIp(req), now) || !this.helloPeerGate.admit(peer, now)) {
+        socket.write('HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\n\r\n')
+        socket.destroy()
+        return
+      }
+      this.preHello.set(peer, open + 1)
+      this.wss.handleUpgrade(req, socket, head, (ws) => this.registerAgent(ws, peer))
       return
     }
     const sub = subdomainOf(req.headers.host ?? '', this.opts.apex)
     const cookies = parseCookies(req.headers.cookie)
-    if (sub === null || !verify(this.opts.cookieSecret, sub, cookies[COOKIE_NAME] ?? '')) {
+    if (sub === null || !verify(this.opts.cookieSecret, sub, cookies[COOKIE_NAME] ?? '', this.opts.claims.sessionVersionOf(sub))) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
       socket.destroy()
       return
@@ -980,23 +1148,60 @@ export class RelayServer {
     this.wss.handleUpgrade(req, socket, head, (browser) => this.bridgeSocket(route.conn, browser, req))
   }
 
-  private registerAgent(ws: WebSocket): void {
+  private registerAgent(ws: WebSocket, peer: string): void {
+    // Everything before HELLO is hostile until proven otherwise: an error
+    // handler from the first moment (an unhandled 'error' would throw), a
+    // deadline to say HELLO, and a schema check on what arrives. The peer's
+    // pre-HELLO budget is released as soon as the socket is authenticated or gone.
+    let released = false
+    const release = (): void => {
+      if (released) return
+      released = true
+      const n = (this.preHello.get(peer) ?? 1) - 1
+      if (n <= 0) this.preHello.delete(peer)
+      else this.preHello.set(peer, n)
+    }
+    ws.on('error', (err: Error) => {
+      if (process.env.DSHN_DEBUG) console.error(`[relay] agent ws (pre-hello, ${peer}) ERROR ${err.message}`)
+      ws.terminate()
+    })
+    ws.once('close', release)
+    const deadline = setTimeout(() => {
+      if (process.env.DSHN_DEBUG) console.error(`[relay] no HELLO from ${peer} within ${this.opts.helloTimeoutMs ?? HELLO_TIMEOUT_MS}ms — dropping`)
+      ws.terminate()
+    }, this.opts.helloTimeoutMs ?? HELLO_TIMEOUT_MS)
+    const deny = (reason: string): void => {
+      try { ws.send(encodeControl({ t: 'deny', reason })) } catch { /* socket already gone */ }
+      ws.close()
+    }
     // The first frame must be a valid HELLO or the socket is dropped.
     ws.once('message', (data: RawData, isBinary: boolean) => {
-      if (isBinary) return ws.close()
-      let frame: ControlFrame
+      clearTimeout(deadline)
+      if (isBinary) return deny('expected hello')
+      let raw: unknown
       try {
-        frame = decodeControl(toBuf(data).toString('utf8'))
+        raw = decodeControl(toBuf(data).toString('utf8'))
       } catch {
-        return ws.close()
+        return deny('malformed hello')
       }
-      if (frame.t !== 'hello') return ws.close()
-      const result = this.opts.claims.claimOrVerify(frame.subdomain, frame.password, Date.now())
-      if (!result.ok) {
-        ws.send(encodeControl({ t: 'deny', reason: result.reason ?? 'rejected' }))
-        ws.close()
-        return
-      }
+      const checked = checkHello(raw)
+      if (typeof checked === 'string') return deny(checked)
+      const frame = checked
+      this.opts.claims.claimOrVerify(frame.subdomain, frame.password, Date.now()).then((result) => {
+        if (ws.readyState !== WebSocket.OPEN) return
+        if (!result.ok) return deny(result.reason ?? 'rejected')
+        release()
+        this.admitAgent(ws, frame)
+      }, (err: unknown) => {
+        console.error(`dshn-relay: claim check failed: ${(err as Error).message}`)
+        deny('relay error')
+      })
+    })
+  }
+
+  /** An authenticated agent: wire it into the routing tables and answer READY. */
+  private admitAgent(ws: WebSocket, frame: HelloFrame): void {
+    {
       const sub = frame.subdomain
       // Multi-device: several agents may hold one subdomain, keyed by device id.
       // Only the SAME device id supersedes (a reconnect); a legacy agent without
@@ -1026,22 +1231,23 @@ export class RelayServer {
         }
         this.cleanup(conn)
       })
-      ws.on('error', (err: Error) => {
-        if (process.env.DSHN_DEBUG) console.error(`[relay] agent ws "${sub}" ERROR ${err.message}`)
-        ws.terminate()
-      })
+      // The pre-HELLO error handler (terminate) stays in place for the socket's life.
       const ready: ReadyFrame = { t: 'ready', subdomain: sub, publicUrl: `https://${sub}.${this.opts.apex}`, ...this.routeFields(sub) }
       ws.send(encodeControl(ready))
-    })
+    }
   }
 
   private onAgentFrame(conn: AgentConnection, data: RawData, isBinary: boolean): void {
     // One tenant's malformed frame must never throw into the relay's event loop
-    // and take down every other tenant's tunnel. Handle under one guard.
+    // and take down every other tenant's tunnel. But it is also a protocol
+    // violation from a peer that has to speak our framing: rather than dropping
+    // it and leaving whatever stream it addressed pending forever, the
+    // connection is closed — cleanup fails its streams and the agent redials.
     try {
       this.dispatchAgentFrame(conn, data, isBinary)
-    } catch {
-      // Drop the frame; the connection stays up for its other streams.
+    } catch (err) {
+      if (process.env.DSHN_DEBUG) console.error(`[relay] agent "${conn.subdomain}" sent a malformed frame (${(err as Error).message}) — terminating`)
+      conn.ws.terminate()
     }
   }
 
@@ -1050,28 +1256,47 @@ export class RelayServer {
       const frame = decodeData(toBuf(data))
       if (frame.kind === DATA_RES_BODY) {
         this.trafficOf(conn.subdomain).bytesOut += frame.payload.length
-        conn.responses.get(frame.id)?.write(Buffer.from(frame.payload))
+        const res = conn.responses.get(frame.id)
+        if (res === undefined) return
+        conn.activity.set(frame.id, Date.now())
+        // No flow-control frame exists to slow the agent down, so a public
+        // client that cannot keep up is dropped once its buffer is deep enough.
+        if (res.writableLength > MAX_BUFFERED) {
+          conn.responses.delete(frame.id)
+          conn.activity.delete(frame.id)
+          res.destroy()
+          conn.send({ t: 'abort', id: frame.id, reason: 'client too slow' })
+          return
+        }
+        res.write(Buffer.from(frame.payload))
       } else if (frame.kind === DATA_WS_TEXT || frame.kind === DATA_WS_BINARY) {
         this.trafficOf(conn.subdomain).bytesOut += frame.payload.length
-        conn.sockets.get(frame.id)?.send(Buffer.from(frame.payload), { binary: frame.kind === DATA_WS_BINARY })
+        const sock = conn.sockets.get(frame.id)
+        if (sock === undefined) return
+        if (sock.bufferedAmount > MAX_BUFFERED) {
+          conn.sockets.delete(frame.id)
+          sock.close(1013, 'client too slow')
+          conn.send({ t: 'ws_close', id: frame.id, code: 1013, reason: 'client too slow' })
+          return
+        }
+        sock.send(Buffer.from(frame.payload), { binary: frame.kind === DATA_WS_BINARY })
       }
       return
     }
-    let frame: ControlFrame
-    try {
-      frame = decodeControl(toBuf(data).toString('utf8'))
-    } catch {
-      return
-    }
+    // A control frame that is not JSON throws out to onAgentFrame (violation).
+    const frame = decodeControl(toBuf(data).toString('utf8'))
+    if (frame === null || typeof frame !== 'object' || typeof frame.t !== 'string') throw new Error('control frame is not an object')
     switch (frame.t) {
       case 'res_head': {
         const res = conn.responses.get(frame.id)
+        conn.activity.set(frame.id, Date.now())
         if (res !== undefined && !res.headersSent) res.writeHead(frame.status, flatHeaders(frame.headers))
         break
       }
       case 'res_end':
         conn.responses.get(frame.id)?.end()
         conn.responses.delete(frame.id)
+        conn.activity.delete(frame.id)
         break
       case 'ws_reject':
         conn.sockets.get(frame.id)?.close(1011, `origin rejected (${frame.status})`)
@@ -1084,6 +1309,7 @@ export class RelayServer {
       case 'abort':
         conn.responses.get(frame.id)?.destroy()
         conn.responses.delete(frame.id)
+        conn.activity.delete(frame.id)
         conn.sockets.get(frame.id)?.close()
         conn.sockets.delete(frame.id)
         break
@@ -1107,6 +1333,13 @@ export class RelayServer {
     browser.on('message', (data: RawData, isBinary: boolean) => {
       const buf = toBuf(data)
       traffic.bytesIn += buf.length
+      // A browser socket cannot be paused; a sender that outruns the agent
+      // uplink by a wide margin is dropped rather than buffered without bound.
+      if (conn.ws.bufferedAmount > MAX_BUFFERED) {
+        if (conn.sockets.delete(id)) conn.send({ t: 'ws_close', id, code: 1013, reason: 'uplink congested' })
+        browser.close(1013, 'uplink congested')
+        return
+      }
       conn.sendData(isBinary ? DATA_WS_BINARY : DATA_WS_TEXT, id, buf)
     })
     browser.on('close', (code: number, reason: Buffer) => {
@@ -1127,5 +1360,6 @@ export class RelayServer {
     for (const sock of conn.sockets.values()) sock.close(1011, 'tunnel closed')
     conn.responses.clear()
     conn.sockets.clear()
+    conn.activity.clear()
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "@dshn/relay",
-  "version": "0.1.0",
+  "version": "0.4.1",
   "type": "module",
   "description": "The ds.hn relay: terminates public *.ds.hn requests behind Cloudflare, gates them with a login, and bridges them over one WSS to each device's dshn-agent.",
   "main": "lib/index.js",

@@ -36,8 +36,11 @@ export interface PremiumDns {
 /** TTL for the dedicated record: short, so a route change propagates quickly. */
 const PREMIUM_TTL_S = 120
 
-/** Comment stamped on records the relay creates, so an operator can tell them apart. */
-const RECORD_COMMENT = 'dshn premium route (managed by the relay)'
+/** Comment stamped on records the relay creates — the ownership mark it later trusts. */
+export const RECORD_COMMENT = 'dshn premium route (managed by the relay)'
+
+/** Cloudflare API call budget. */
+const CF_TIMEOUT_MS = 15_000
 
 interface CfEnvelope<T> {
   success: boolean
@@ -67,6 +70,9 @@ export class CloudflareDns implements PremiumDns {
       method,
       headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
+      // A hung API call must not hold an admin request (and the per-subdomain
+      // DNS queue behind it) open forever.
+      signal: AbortSignal.timeout(CF_TIMEOUT_MS),
     })
     let env: CfEnvelope<T>
     try {
@@ -85,40 +91,52 @@ export class CloudflareDns implements PremiumDns {
     return this.call<CfRecord[]>('GET', `?type=A&name=${encodeURIComponent(name)}&per_page=50`)
   }
 
+  /** Whether a record is one of ours: the comment the relay stamps is the ownership mark. */
+  private owned(rec: CfRecord, name: string): boolean {
+    return rec.type === 'A' && rec.name === name && rec.comment === RECORD_COMMENT
+  }
+
   async point(name: string, ip: string): Promise<DnsRecordRef> {
     const existing = await this.findA(name)
-    const ours = existing.find((r) => r.content === ip)
-    if (ours !== undefined && !ours.proxied) return { id: ours.id, content: ours.content }
-    // Reuse a record of ours (same target, or stamped with our comment from an
-    // earlier accelerator address) rather than leaving two answers. Any OTHER A
-    // record of that exact name belongs to the operator: adding ours beside it
-    // would round-robin the name between two targets, and rewriting it would
-    // destroy something the relay did not create — so refuse and say why.
-    const reuse = ours ?? existing.find((r) => r.comment === RECORD_COMMENT)
-    if (reuse === undefined && existing.length > 0) {
-      const targets = existing.map((r) => r.content).join(', ')
-      throw new Error(`"${name}" already has an A record (${targets}) not managed by the relay; remove it first`)
+    // Ownership is the comment, never the target: a record the operator set by
+    // hand that happens to point at the accelerator is still theirs. Ours is
+    // reused (retargeted or un-proxied as needed) so the name never has two
+    // answers; anything else of that exact name makes enabling fail with a
+    // message, because adding beside it would round-robin the name and
+    // rewriting it would destroy something the relay did not create.
+    const ours = existing.find((r) => this.owned(r, name))
+    const foreign = existing.filter((r) => !this.owned(r, name))
+    if (foreign.length > 0) {
+      const targets = foreign.map((r) => r.content).join(', ')
+      throw new Error(`"${name}" already has an A record (${targets}) not managed by the relay; remove it (or stamp it with the comment "${RECORD_COMMENT}" to adopt it) first`)
     }
+    if (ours !== undefined && ours.content === ip && !ours.proxied) return { id: ours.id, content: ours.content }
     const payload = { type: 'A', name, content: ip, proxied: false, ttl: PREMIUM_TTL_S, comment: RECORD_COMMENT }
-    const rec = reuse === undefined
+    const rec = ours === undefined
       ? await this.call<CfRecord>('POST', '', payload)
-      : await this.call<CfRecord>('PATCH', `/${reuse.id}`, payload)
+      : await this.call<CfRecord>('PATCH', `/${ours.id}`, payload)
     return { id: rec.id, content: rec.content }
   }
 
-  async unpoint(name: string, id: string | undefined, ip: string): Promise<void> {
+  async unpoint(name: string, id: string | undefined, _ip: string): Promise<void> {
     if (id !== undefined) {
+      // Re-read the record before deleting by id: an id remembered from an
+      // earlier life of the name may now belong to a record the operator made.
+      let rec: CfRecord | null = null
       try {
-        await this.call<unknown>('DELETE', `/${id}`)
-        return
+        rec = await this.call<CfRecord>('GET', `/${id}`)
       } catch (err) {
-        // Already gone (deleted by hand) → fall through to the name lookup, which
-        // is also a no-op then. Any other failure is reported.
         if (!/\b(81044|404|not found)\b/i.test((err as Error).message)) throw err
       }
+      if (rec !== null) {
+        if (!this.owned(rec, name)) throw new Error(`DNS record ${id} is not the relay's record for "${name}" (${rec.name} → ${rec.content}); not deleting it`)
+        await this.call<unknown>('DELETE', `/${id}`)
+        return
+      }
+      // Gone already (deleted by hand) → sweep by name below, a no-op then.
     }
     for (const rec of await this.findA(name)) {
-      if (rec.content === ip) await this.call<unknown>('DELETE', `/${rec.id}`)
+      if (this.owned(rec, name)) await this.call<unknown>('DELETE', `/${rec.id}`)
     }
   }
 }

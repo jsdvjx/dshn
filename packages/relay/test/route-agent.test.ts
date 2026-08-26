@@ -188,8 +188,14 @@ describe('agent follows relay-assigned routes', () => {
     // from 1 again, and a survivor would answer to a stranger's id.
     await until(() => origin.live.size === 0 && browserClosed, 4000)
 
-    // A fresh visitor socket over the new connection works.
-    const browser2 = await visitorSocket(port, session)
+    // A fresh visitor socket over the new connection works. The redial leaves a
+    // brief window with no live device (old socket gone, new not yet READY), so
+    // retry the open until the agent has settled on the premium path.
+    let browser2: InstanceType<typeof WebSocket> | null = null
+    for (let i = 0; i < 50 && browser2 === null; i += 1) {
+      try { browser2 = await visitorSocket(port, session) } catch { await sleep(50) }
+    }
+    if (browser2 === null) throw new Error('could not reopen a visitor socket after the redial')
     await until(() => origin.live.size === 1)
     browser2.close()
     await until(() => origin.live.size === 0)

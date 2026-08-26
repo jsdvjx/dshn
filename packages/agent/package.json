@@ -1,6 +1,6 @@
 {
   "name": "@dshn/agent",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Forward this machine's local DeepSeek Harness (dsh) web service to the public internet over ds.hn: an outbound WSS tunnel to the relay, plus the trust-fence integration that lets forwarded requests through.",
   "keywords": [
     "dsh",

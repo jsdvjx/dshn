@@ -21,26 +21,32 @@ const MAX_AGE_S = 30 * 24 * 3600
  * @param maxAgeS - session lifetime in seconds; defaults to the tunnel session's.
  * @returns the cookie value `exp.mac`.
  */
-export function sign(secret: string, subdomain: string, maxAgeS: number = MAX_AGE_S): string {
+export function sign(secret: string, subdomain: string, maxAgeS: number = MAX_AGE_S, version = ''): string {
   const exp = Math.floor(Date.now() / 1000) + maxAgeS
-  const mac = createHmac('sha256', secret).update(`${subdomain}.${exp}`).digest('base64url')
+  const mac = createHmac('sha256', secret).update(`${subdomain}.${exp}.${version}`).digest('base64url')
   return `${exp}.${mac}`
 }
 
 /**
- * Verify a session value against a subdomain: unexpired and correctly signed.
+ * Verify a session value against a subdomain: unexpired and correctly signed
+ * for the CURRENT version of what it unlocks. The version (a claim's session
+ * version, see `ClaimStore.sessionVersionOf`) is part of the MAC, so when the
+ * claim is released and re-created every earlier session stops verifying —
+ * revocation without a server-side session table. A null version means
+ * nothing can be valid (the name is not claimed).
  * @param secret - the relay's cookie-signing secret.
  * @param subdomain - the subdomain the request is for.
  * @param value - the presented cookie value.
+ * @param version - the current session version to bind to.
  * @returns whether the session is valid.
  */
-export function verify(secret: string, subdomain: string, value: string): boolean {
-  if (value === '') return false
+export function verify(secret: string, subdomain: string, value: string, version: string | null = ''): boolean {
+  if (value === '' || version === null) return false
   const dot = value.indexOf('.')
   if (dot < 0) return false
   const exp = Number(value.slice(0, dot))
   if (!Number.isFinite(exp) || exp < Math.floor(Date.now() / 1000)) return false
-  const expected = createHmac('sha256', secret).update(`${subdomain}.${exp}`).digest('base64url')
+  const expected = createHmac('sha256', secret).update(`${subdomain}.${exp}.${version}`).digest('base64url')
   return constantTimeEqual(value.slice(dot + 1), expected)
 }
 

@@ -124,8 +124,8 @@ describe('E2E bootstrap through a real tunnel', () => {
     expect(xhr.body.toString('utf8')).toBe(SHELL)
   })
 
-  it('still seals /api', async () => {
-    const api = await request('/api/ping', { cookie: session, accept: 'application/json' })
+  it('still seals /api requests the shim marked', async () => {
+    const api = await request('/api/ping', { cookie: session, accept: 'application/json', 'x-dshn-e2e': '1' })
     expect(api.headers['x-dshn-e2e']).toBe('1')
     expect(api.body.toString('utf8')).not.toContain('"ok"')
   })
