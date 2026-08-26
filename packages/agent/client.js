@@ -574,6 +574,64 @@ window.__ModuleLoader__.load({
     // cloud/local inconsistency of a dead pill appearing remotely.
     const pageLoopback = (() => { const hn = location.hostname; return hn === 'localhost' || hn === '::1' || /^127\./.test(hn) })()
 
+    // ── remote settings notice ────────────────────────────────────────────────
+    // dsh makes model/provider settings (which edit API keys and credentials)
+    // editable ONLY from a loopback browser — its settings RPCs are loopback-
+    // only by design, so a page opened over ds.hn gets a hard error:
+    //   "加载提供方目录失败: settings are unavailable in this browser".
+    // That is a security boundary, not a bug, so we do NOT bypass it. But the raw
+    // error reads like a failure; on a remote page we replace it in place with a
+    // calm explanation of WHY and WHERE to do it instead, and drop the useless
+    // Retry button. `settings are unavailable in this browser` is dsh's hardcoded,
+    // non-localized fallback string — a stable anchor across locales and versions.
+    ;(function installRemoteSettingsNotice() {
+      if (typeof document === 'undefined' || pageLoopback || typeof MutationObserver === 'undefined') return
+      const SENTINEL = 'settings are unavailable in this browser'
+      const zh = String(document.documentElement.lang || navigator.language || 'en').toLowerCase().indexOf('zh') === 0
+      const L = zh
+        ? { title: '此设置只能在本机修改', body: '为保护 API 密钥等凭据，dsh 只允许在运行它的那台电脑上编辑模型与提供方设置；通过 ds.hn 公网访问时这里不可用。', how: '请在那台电脑上直接打开 dsh 的本地页面（如 http://localhost:<端口>）来添加或修改密钥。' }
+        : { title: 'These settings can only be changed on the host', body: 'To protect credentials like API keys, dsh only lets you edit model and provider settings on the machine running it; they are unavailable over the public ds.hn address.', how: 'Open dsh’s local page on that machine (e.g. http://localhost:<port>) to add or change keys.' }
+
+      // The innermost element whose text is exactly dsh's error line — the <p>
+      // dsh rendered — so we restyle that node and not some huge ancestor.
+      const errorNode = (root) => {
+        let hit = null
+        const walk = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+          acceptNode: (el) => (el.textContent && el.textContent.indexOf(SENTINEL) !== -1 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP),
+        })
+        for (let el = walk.nextNode(); el !== null; el = walk.nextNode()) hit = el // last (deepest) match wins
+        return hit
+      }
+
+      // Keyed on the sentinel still being present, not a one-shot flag: after a
+      // transform the node no longer contains it, so it is not reprocessed; if
+      // dsh re-renders and the raw text returns, the observer transforms it
+      // again. Self-healing against React reconciliation, no stale flag to block.
+      const transform = (p) => {
+        if (p === null) return
+        p.dataset.dshnSettingsNotice = '1'
+        p.textContent = ''
+        p.style.cssText = 'color:var(--dsw-alias-label-secondary,#5a6069);background:var(--dsw-alias-bg-layer-2,rgba(128,134,142,.1));border:1px solid var(--dsw-alias-border-l1,rgba(128,134,142,.28));border-radius:10px;padding:12px 14px;margin:4px 0;font-size:12.5px;line-height:1.5;display:block;max-width:520px'
+        const row = document.createElement('div')
+        row.style.cssText = 'display:flex;gap:8px;align-items:flex-start'
+        const icon = document.createElement('span'); icon.textContent = '🔒'; icon.style.cssText = 'flex:none;font-size:14px;line-height:1.3'
+        const col = document.createElement('div')
+        const t = document.createElement('div'); t.textContent = L.title; t.style.cssText = 'font-weight:600;color:var(--dsw-alias-label-primary,#1c1e21);margin-bottom:3px'
+        const b = document.createElement('div'); b.textContent = L.body
+        const hwrap = document.createElement('div'); hwrap.textContent = L.how; hwrap.style.cssText = 'margin-top:6px;opacity:.85'
+        col.appendChild(t); col.appendChild(b); col.appendChild(hwrap)
+        row.appendChild(icon); row.appendChild(col); p.appendChild(row)
+        // The Retry button next to it can't help (this is a boundary, not a blip).
+        const host = p.parentElement
+        if (host !== null) for (const btn of host.querySelectorAll('button')) btn.style.display = 'none'
+      }
+
+      const scan = () => { try { transform(errorNode(document.body)) } catch { /* never break the page */ } }
+      const obs = new MutationObserver(scan)
+      const arm = () => { obs.observe(document.body, { childList: true, subtree: true, characterData: true }); scan() }
+      if (document.body) arm(); else document.addEventListener('DOMContentLoaded', arm)
+    })()
+
     // One poller feeds both slot entries (the footer button and the overlay),
     // kept in a tiny shared store so they never fight over state.
     const store = {
