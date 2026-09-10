@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { ClaimStore } from '../src/claims.js'
 import { RelayServer } from '../src/server.js'
@@ -68,12 +69,19 @@ describe('E2E bootstrap through a real tunnel', () => {
   let dir: string, relay: RelayServer, port: number, origin: http.Server, originPort: number, tunnel: AgentTunnel, session: string
   const seen: Array<{ path: string; encoding: string | undefined; accept: string | undefined }> = []
 
-  function request(path: string, headers: Record<string, string> = {}, method = 'GET', body?: string): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> {
+  /** `body` is the decoded payload; `raw` is what actually crossed the wire. */
+  function request(path: string, headers: Record<string, string> = {}, method = 'GET', body?: string): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer; raw: Buffer }> {
     return new Promise((resolve, reject) => {
       const req = http.request({ host: '127.0.0.1', port, path, method }, (res) => {
         const chunks: Buffer[] = []
         res.on('data', (c: Buffer) => chunks.push(c))
-        res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks) }))
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks)
+          // The agent gzips what it can on the way into the tunnel; a browser
+          // decodes transparently, so the assertions work on the plaintext.
+          const decoded = res.headers['content-encoding'] === 'gzip' ? gunzipSync(raw) : raw
+          resolve({ status: res.statusCode ?? 0, headers: res.headers, body: decoded, raw })
+        })
       })
       req.setHeader('host', `${SUB}.${APEX}`)
       for (const [k, v] of Object.entries(headers)) req.setHeader(k, v)
@@ -112,7 +120,11 @@ describe('E2E bootstrap through a real tunnel', () => {
     const info = tunnel.e2eInfo()
     expect(html).toBe(injectE2EBootstrap(SHELL_OUT, { salt: info.salt, device: tunnel.deviceId }))
     expect(html.indexOf('(function (__dshnInfo)')).toBeLessThan(html.indexOf('window.__first'))
-    expect(Number(res.headers['content-length'])).toBe(res.body.length)
+    // Gzipped on the way out (the visitor offered it), and the length describes
+    // what crossed the tunnel rather than the plaintext.
+    expect(res.headers['content-encoding']).toBe('gzip')
+    expect(res.raw.length).toBeLessThan(res.body.length)
+    expect(Number(res.headers['content-length'])).toBe(res.raw.length)
     // The origin was asked for plaintext so the document could be edited.
     expect(seen.find((s) => s.path === '/')?.encoding).toBe('identity')
   })

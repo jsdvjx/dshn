@@ -33,9 +33,14 @@ copyFileSync('packages/agent/cordis.patch.yml', 'dist/dshn/cordis.patch.yml')
 copyFileSync('README.md', 'dist/dshn/README.md')
 copyFileSync('README.zh.md', 'dist/dshn/README.zh.md')
 copyFileSync('LICENSE', 'dist/dshn/LICENSE')
+// The shipped manifest is REWRITTEN (its deps are inlined, its files differ),
+// but anything dsh reads from it — the version and the whole `dsh` block, which
+// carries the bundle patch and the client module's package edges — is taken from
+// the source manifest so the two can never drift apart.
+const agentPkg = JSON.parse(readFileSync('packages/agent/package.json', 'utf8'))
 writeFileSync('dist/dshn/package.json', JSON.stringify({
   name: '@dshn/agent',
-  version: JSON.parse(readFileSync('packages/agent/package.json', 'utf8')).version,
+  version: agentPkg.version,
   description: 'Forward a local dsh web service to the public internet over ds.hn (bundled).',
   keywords: ['dsh', 'dsh-plugin', 'deepseek-harness', 'tunnel', 'forwarding', 'ds.hn'],
   license: 'MIT',
@@ -47,10 +52,7 @@ writeFileSync('dist/dshn/package.json', JSON.stringify({
   main: 'lib/index.js',
   exports: { '.': './lib/index.js', './client': './client.js', './package.json': './package.json' },
   files: ['lib', 'client.js', 'cordis.patch.yml', 'README.md', 'README.zh.md', 'LICENSE'],
-  dsh: {
-    bundle: { patch: 'cordis.patch.yml' },
-    client: { platform: 'web', inject: ['@deepseek-ai/dsh-client-runtime', '@deepseek-ai/dsh-client-ui-layout'] },
-  },
+  dsh: agentPkg.dsh,
   // No runtime dependencies: schemastery, ws, and @dshn/protocol are all inlined
   // by esbuild, so `npm i dshn` (or `dsh plugin add dshn`) pulls a
   // single self-contained package. cordis is provided by the dsh host at runtime.

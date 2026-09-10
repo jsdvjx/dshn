@@ -36,8 +36,33 @@ the relay operator sees only ciphertext.
   can be remembered per-device in `localStorage` (never transmitted).
 - **Native UI.** Config lives in dsh's own Settings ("公网转发" / *Public
   forwarding*); a footer row shows live latency and links to it.
+- **Compressed uplink.** Response bodies are gzipped before they enter the
+  tunnel, because the agent→relay hop is the narrow one and dsh's own web server
+  compresses nothing by default. A cold app load drops from ~12.5 MB to ~5.0 MB
+  on the wire (2.5×); a response dsh already encoded is passed through untouched.
 - **Self-hosted data plane.** Traffic rides Cloudflare's edge to *your* server —
   no per-user Cloudflare account, no NS delegation.
+
+## dsh compatibility
+
+Tested against **dsh 0.1.5-rc.1** (and built to keep working on older ones).
+
+From **dsh 0.1.2-rc.1** onward, dsh fences its app shell and every `/api` call
+behind a signed, authority-bound browser-session cookie: a browser earns one by
+opening the launch URL dsh prints, and everything else gets
+`401 dsh web authentication required`. A public visitor can never hold that
+cookie — their browser's cookies belong to the public authority, while every
+request the agent replays has its Host rewritten to loopback, and dsh checks the
+cookie against the Host it arrives on. So the agent asks dsh's own `connection`
+service for this process's launch token, spends it over loopback once, and stamps
+the resulting cookie on every replayed request and tunnelled upgrade. The cookie
+never leaves the machine: neither the relay nor the visitor's browser sees it,
+and access stays gated by the relay's login. On a dsh without that fence the
+agent detects it and behaves exactly as it did before.
+
+**Agent 0.4.0 is required for dsh ≥ 0.1.2.** Earlier agents forward a 401 page
+and nothing else. No relay change is needed — the fix is entirely in the agent,
+so a deployed relay keeps serving both.
 
 ## Architecture
 
@@ -165,12 +190,15 @@ grey-cloud (DNS-only) `origin.ds.hn` A record and point agents at it with
 
 ## Status
 
-Working end-to-end. Known gaps: an occasional tunnel-socket drop fails that
-connection's in-flight requests (no request replay yet); Cloudflare can reset the
-tunnel under sustained heavy throughput (use the direct-origin option); the CF
-free-plan 100 MB request cap can clip large dsh image uploads; the claim store is
-trust-on-first-use with no account layer; and the relay origin should be locked
-to Cloudflare IPs + Authenticated Origin Pulls in production.
+Working end-to-end against dsh 0.1.5-rc.1. Known gaps: an occasional
+tunnel-socket drop fails that connection's in-flight requests (no request replay
+yet); Cloudflare can reset the tunnel under sustained heavy throughput (use the
+direct-origin option); the CF free-plan 100 MB request cap can clip large dsh
+image uploads; a single tunnel frame is capped at 128 MB, below dsh's own 300 MB
+request-body limit, so an end-to-end-sealed response larger than that would fail;
+end-to-end-sealed `/api` bodies are not compressed (ciphertext does not compress);
+the claim store is trust-on-first-use with no account layer; and the relay origin
+should be locked to Cloudflare IPs + Authenticated Origin Pulls in production.
 
 ## License
 

@@ -5,11 +5,13 @@
  * It opens one outbound WebSocket to the relay, claims a subdomain with the
  * (subdomain, password) the user typed in the setup dialog, and then replays
  * whatever the relay forwards against the local dsh server: HTTP over
- * `node:http`, and dsh's own downlink WebSockets (`/api/events.*`) over a
+ * `node:http`, and dsh's own downlink WebSocket (`/api/remote.mux`) over a
  * tunnelled `ws` client. Each replayed request has its Host/Origin rewritten to
- * loopback, so dsh's `/api` trust fence accepts it as a local same-origin
- * request for ANY public subdomain — no composition-time trustedHosts entry, and
- * access gated instead by the relay's login.
+ * loopback AND carries dsh's own browser-session cookie (see `dsh-auth.ts`), so
+ * dsh's `/api` fence accepts it as a local, same-origin, authenticated request
+ * for ANY public subdomain — no composition-time trustedHosts entry, and access
+ * gated instead by the relay's login. Bodies are gzipped on the way out (see
+ * `compress.ts`): the uplink to the relay is the narrow hop in the whole path.
  *
  * The browser half (client.js) is the setup dialog + status widget; it drives
  * the `/dshn/status`, `/dshn/configure`, and `/dshn/disconnect` routes this half
@@ -47,6 +49,8 @@ import {
 } from '@dshn/protocol'
 import { deriveKey, newSalt, open as e2eOpen, seal as e2eSeal } from './crypto.js'
 import { credentialManifestLinks, injectE2EBootstrap } from './e2e-shim.js'
+import { DshAuth, type DshConnection } from './dsh-auth.js'
+import { acceptsGzip, GZIP_DROP_HEADERS, gzipBody, shouldGzip, tunnelGzip } from './compress.js'
 
 export const name = '@dshn/agent'
 
@@ -323,6 +327,23 @@ function headerListFromRaw(raw: string[]): HeaderList {
   return out
 }
 
+/**
+ * First value of a header in a request header list, case-insensitively.
+ * @param headers - the header list.
+ * @param name - lowercased header name.
+ * @returns the value, or undefined.
+ */
+function headerValue(headers: HeaderList, name: string): string | undefined {
+  for (const [k, v] of headers) if (k.toLowerCase() === name) return v
+  return undefined
+}
+
+/** A node response header as one string (node exposes repeated headers as arrays). */
+function responseHeader(headers: http.IncomingHttpHeaders, name: string): string | undefined {
+  const v = headers[name]
+  return Array.isArray(v) ? v.join(', ') : v
+}
+
 /** WebSocket handshake headers that `ws` regenerates per hop and must not be forwarded. */
 const WS_STRIP = new Set([
   'connection',
@@ -355,6 +376,14 @@ export class AgentTunnel {
   private readonly reqE2E = new Map<number, { method: string; path: string; headers: http.OutgoingHttpHeaders; marked: boolean; chunks: Buffer[] }>()
   /** Tunnelled local dsh WebSockets, by stream id. */
   private readonly sockets = new Map<number, WebSocket>()
+  /**
+   * Requests parked until dsh's session cookie is in hand, by stream id. Only
+   * the first requests of a process can land here — the cookie exchange is one
+   * loopback round trip started at plugin apply, long before the relay has
+   * finished dialling — but a replay issued without the cookie comes back 401,
+   * so they wait rather than fail.
+   */
+  private readonly parked = new Map<number, { method: string; path: string; headers: HeaderList; chunks: Buffer[]; ended: boolean }>()
   /** Derived AES key when an e2e password is set; null when E2E is off. */
   private e2eKey: Buffer | null = null
   /** Public salt for the current e2e key. */
@@ -394,7 +423,16 @@ export class AgentTunnel {
   /** The in-flight probe of the premium host, if one is running. */
   private routeProbe: Promise<void> | null = null
 
-  constructor(private readonly config: AgentConfig, private readonly localPort: () => number, private readonly store: CredsStore) {
+  constructor(
+    private readonly config: AgentConfig,
+    private readonly localPort: () => number,
+    private readonly store: CredsStore,
+    /**
+     * dsh's browser-session authenticator. Null when there is nothing to
+     * authenticate against: a dsh predating the fence, or a test's fake origin.
+     */
+    private readonly dshAuth: DshAuth | null = null,
+  ) {
     this.deviceId = createHash('sha256').update(`${hostname()}|${config.statePath}`).digest('hex').slice(0, 12)
     this.deviceName = (process.env.DSHN_DEVICE_NAME ?? hostname()).trim().slice(0, 40) || this.deviceId
     this.creds = this.store.load()
@@ -625,6 +663,7 @@ export class AgentTunnel {
     this.requests.clear()
     this.sockets.clear()
     this.reqE2E.clear()
+    this.parked.clear()
   }
 
   /**
@@ -937,8 +976,10 @@ export class AgentTunnel {
     if (isBinary) {
       const frame = decodeData(buf)
       if (frame.kind === DATA_REQ_BODY) {
+        const waiting = this.parked.get(frame.id)
         const buffered = this.reqE2E.get(frame.id)
-        if (buffered !== undefined) buffered.chunks.push(Buffer.from(frame.payload))
+        if (waiting !== undefined) waiting.chunks.push(Buffer.from(frame.payload))
+        else if (buffered !== undefined) buffered.chunks.push(Buffer.from(frame.payload))
         else this.requests.get(frame.id)?.write(Buffer.from(frame.payload))
       } else if (frame.kind === DATA_WS_TEXT || frame.kind === DATA_WS_BINARY) {
         this.sockets.get(frame.id)?.send(Buffer.from(frame.payload), { binary: frame.kind === DATA_WS_BINARY })
@@ -993,6 +1034,10 @@ export class AgentTunnel {
         this.openRequest(frame.id, frame.method, frame.path, frame.headers)
         break
       case 'req_end': {
+        const waiting = this.parked.get(frame.id)
+        // Still waiting on the session cookie: remember that the body is
+        // complete, and releaseParked will end the replay after replaying it.
+        if (waiting !== undefined) { waiting.ended = true; break }
         const buffered = this.reqE2E.get(frame.id)
         if (buffered !== undefined) this.finishE2ERequest(frame.id)
         else this.requests.get(frame.id)?.end()
@@ -1007,6 +1052,7 @@ export class AgentTunnel {
       case 'abort':
         this.requests.get(frame.id)?.destroy()
         this.reqE2E.delete(frame.id)
+        this.parked.delete(frame.id)
         this.sockets.get(frame.id)?.close()
         break
       default:
@@ -1037,6 +1083,17 @@ export class AgentTunnel {
     const authority = this.loopbackAuthority()
     out.host = authority
     if (out.origin !== undefined) out.origin = `http://${authority}`
+    // dsh gates the app shell and every /api call behind a signed cookie bound
+    // to the Host it arrives on. A public visitor's browser cannot hold one for
+    // this loopback authority, so the agent presents its own — and drops any
+    // `dsh-auth-*` the visitor sent, which could only shadow it.
+    if (this.dshAuth !== null) {
+      const sent = out.cookie
+      const visitor = Array.isArray(sent) ? sent.join('; ') : typeof sent === 'string' ? sent : undefined
+      const cookie = this.dshAuth.stamp(visitor)
+      if (cookie === undefined) delete out.cookie
+      else out.cookie = cookie
+    }
     // Mark every replayed tunnel request. The /dshn/* management routes treat any
     // request bearing this header as NON-local — so even a path-confusion bypass
     // of the /dshn/ guard (e.g. `/api/../dshn/status` or `/%2e/dshn/status`, which
@@ -1064,6 +1121,50 @@ export class AgentTunnel {
       return
     }
     this.served += 1
+    // dsh's session cookie must be in hand before the first replay, or the app
+    // shell itself comes back 401. Park the stream — head now, body frames as
+    // they arrive — for the one loopback round trip the exchange takes.
+    if (this.dshAuth !== null && !this.dshAuth.ready()) {
+      this.parked.set(id, { method, path, headers, chunks: [], ended: false })
+      void this.dshAuth.whenReady().then(() => this.releaseParked(id))
+      return
+    }
+    this.replayRequest(id, method, path, headers)
+  }
+
+  /**
+   * Reissue a request that waited for dsh's session cookie, then feed it the
+   * body frames that arrived while it was parked.
+   * @param id - the stream id.
+   */
+  private releaseParked(id: number): void {
+    const held = this.parked.get(id)
+    // Gone: the stream was aborted, or the control socket dropped under us.
+    if (held === undefined) return
+    this.parked.delete(id)
+    this.replayRequest(id, held.method, held.path, held.headers)
+    // The replay now lives in whichever structure owns this stream — or in
+    // neither, when it answered on the spot (E2E fail-closed, dsh unreachable).
+    const buffered = this.reqE2E.get(id)
+    if (buffered !== undefined) {
+      for (const chunk of held.chunks) buffered.chunks.push(chunk)
+      if (held.ended) this.finishE2ERequest(id)
+      return
+    }
+    const req = this.requests.get(id)
+    if (req === undefined) return
+    for (const chunk of held.chunks) req.write(chunk)
+    if (held.ended) req.end()
+  }
+
+  /**
+   * Replay one HTTP request against local dsh and stream the response back.
+   * @param id - the stream id.
+   * @param method - the public request's method.
+   * @param path - the public request's path, verbatim.
+   * @param headers - the public request's headers.
+   */
+  private replayRequest(id: number, method: string, path: string, headers: HeaderList): void {
     const bare = path.split('?', 1)[0]
     const outHeaders = this.loopbackHeaders(headers)
 
@@ -1108,21 +1209,34 @@ export class AgentTunnel {
       delete outHeaders['if-modified-since']
     }
 
+    const acceptEncoding = headerValue(headers, 'accept-encoding')
     const req = http.request(
       { host: this.config.localHost, port: this.localPort(), method, path, headers: outHeaders },
       (res) => {
+        const status = res.statusCode ?? 502
+        // dsh refused the replay as unauthenticated, so our session cookie went
+        // stale under us — a rotated signing secret, or an exchange that never
+        // landed. Mint a fresh one; this response still goes back as dsh wrote
+        // it, and the requests after it are authenticated again. (An expiring
+        // cookie never gets here: `stamp` renews ahead of its expiry.)
+        if (status === 401 && this.dshAuth !== null) this.dshAuth.invalidate()
         const contentType = String(res.headers['content-type'] ?? '')
-        if (wantsDocument && res.statusCode === 200 && /^text\/html\b/i.test(contentType)) {
+        if (wantsDocument && status === 200 && /^text\/html\b/i.test(contentType)) {
           const chunks: Buffer[] = []
           res.on('data', (c: Buffer) => chunks.push(c))
           res.on('end', () => {
             let html = credentialManifestLinks(Buffer.concat(chunks).toString('utf8'))
             if (this.e2eKey !== null) html = injectE2EBootstrap(html, { salt: this.e2eSalt, device: this.deviceId })
-            const body = Buffer.from(html, 'utf8')
+            let body: Buffer = Buffer.from(html, 'utf8')
             // The document was transformed: its validators no longer describe
             // it, and it must not be served from cache without this pass.
             const resHeaders = filterHeaders(headerListFromRaw(res.rawHeaders),
               new Set([...HOP_BY_HOP, 'content-length', 'content-encoding', 'etag', 'last-modified', 'cache-control', 'expires']))
+            const zipped = gzipBody(body, acceptEncoding)
+            if (zipped !== null) {
+              body = zipped
+              resHeaders.push(['content-encoding', 'gzip'], ['vary', 'accept-encoding'])
+            }
             resHeaders.push(['content-length', String(body.length)], ['cache-control', 'no-store'])
             this.send({ t: 'res_head', id, status: 200, headers: resHeaders })
             this.sendData(DATA_RES_BODY, id, body)
@@ -1131,19 +1245,26 @@ export class AgentTunnel {
           res.on('error', () => this.send({ t: 'abort', id, reason: 'response stream error' }))
           return
         }
-        this.send({
-          t: 'res_head',
-          id,
-          status: res.statusCode ?? 502,
-          headers: filterHeaders(headerListFromRaw(res.rawHeaders)),
-        })
+        // Compress on the way out. The uplink to the relay is the narrow hop,
+        // and dsh's own web server compresses nothing by default — a cold app
+        // load is ~1.3 MB of bundles that gzip takes to ~440 KB.
+        const gz = shouldGzip({ status, header: (name) => responseHeader(res.headers, name) }, method, acceptEncoding)
+          ? tunnelGzip()
+          : null
+        const resHeaders = filterHeaders(headerListFromRaw(res.rawHeaders),
+          gz === null ? HOP_BY_HOP : new Set([...HOP_BY_HOP, ...GZIP_DROP_HEADERS]))
+        if (gz !== null) resHeaders.push(['content-encoding', 'gzip'], ['vary', 'accept-encoding'])
+        this.send({ t: 'res_head', id, status, headers: resHeaders })
         // Backpressure: when the control socket is backed up, stop reading from
-        // dsh until the frame carrying this chunk has been written out.
-        res.on('data', (chunk: Buffer) => {
-          if (!this.sendData(DATA_RES_BODY, id, chunk, () => res.resume())) res.pause()
+        // dsh — through the compressor, which propagates the pause up the pipe —
+        // until the frame carrying this chunk has been written out.
+        const body = gz === null ? res : res.pipe(gz)
+        body.on('data', (chunk: Buffer) => {
+          if (!this.sendData(DATA_RES_BODY, id, chunk, () => body.resume())) body.pause()
         })
-        res.on('end', () => this.send({ t: 'res_end', id }))
-        res.on('error', () => this.send({ t: 'abort', id, reason: 'response stream error' }))
+        body.on('end', () => this.send({ t: 'res_end', id }))
+        body.on('error', () => this.send({ t: 'abort', id, reason: 'response stream error' }))
+        if (gz !== null) res.on('error', () => this.send({ t: 'abort', id, reason: 'response stream error' }))
       },
     )
     req.on('error', (err: Error) => {
@@ -1182,6 +1303,7 @@ export class AgentTunnel {
     const req = http.request(
       { host: this.config.localHost, port: this.localPort(), method: pending.method, path: pending.path, headers: pending.headers },
       (res) => {
+        if (res.statusCode === 401 && this.dshAuth !== null) this.dshAuth.invalidate()
         const chunks: Buffer[] = []
         res.on('data', (c: Buffer) => chunks.push(c))
         res.on('end', () => {
@@ -1218,10 +1340,23 @@ export class AgentTunnel {
     // loopback, same-origin request, for any public subdomain.
     forwarded.host = authority
     forwarded.origin = `http://${authority}`
+    // The upgrade crosses the very same fence as /api — 401 included — so it
+    // needs the session cookie too. Header names arrive in the visitor's
+    // casing, so drop any spelling of `cookie` before setting ours.
+    if (this.dshAuth !== null) {
+      let visitor: string | undefined
+      for (const key of Object.keys(forwarded)) {
+        if (key.toLowerCase() !== 'cookie') continue
+        visitor = visitor === undefined ? forwarded[key] : `${visitor}; ${forwarded[key]}`
+        delete forwarded[key]
+      }
+      const cookie = this.dshAuth.stamp(visitor)
+      if (cookie !== undefined) forwarded.cookie = cookie
+    }
     const url = `ws://${this.config.localHost}:${this.localPort()}${path}`
     const sock = new WebSocket(url, { headers: forwarded, origin: forwarded.origin })
 
-    // dsh's event sockets are downlink-only (`/api/events.*`), so we seal each
+    // dsh's event socket is downlink-only (`/api/remote.mux`), so we seal each
     // message the agent pushes to the browser when E2E is on. The type byte
     // preserves text-vs-binary through the (always-binary) ciphertext frame.
     const sealMessages = this.e2eKey !== null && path.split('?', 1)[0].startsWith('/api')
@@ -1370,7 +1505,30 @@ export function apply(ctx: any, rawConfig: Partial<AgentConfig> | undefined): vo
   } catch {
     store = fileStore(config.statePath)
   }
-  const tunnel = new AgentTunnel(config, localPort, store)
+  // dsh ≥0.1.2 gates its app shell and every /api call behind a signed
+  // browser-session cookie (see `dsh-auth.ts`): the agent earns one from dsh's
+  // own `connection` service and stamps it on every replay, or the tunnel
+  // forwards a 401 page and nothing else. `connection` is read through an
+  // OPTIONAL injection rather than the composition row's `inject`, so a dsh
+  // predating the fence still loads this plugin — the authenticator simply
+  // resolves inert there and the agent behaves as it always did.
+  let connection: DshConnection | undefined
+  const dshAuth = new DshAuth({
+    connection: () => connection,
+    authority: () => `${config.localHost}:${localPort()}`,
+    host: () => config.localHost,
+    port: localPort,
+  })
+  try {
+    ctx.inject(['connection'], (connCtx: any) => {
+      connection = connCtx.connection
+      void dshAuth.refresh()
+    })
+  } catch {
+    // No optional-injection surface at all: the authenticator resolves inert on
+    // first use, which is the correct answer for a dsh without the fence.
+  }
+  const tunnel = new AgentTunnel(config, localPort, store, dshAuth)
   const json = (res: http.ServerResponse, status: number, body: unknown) => {
     res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' })
     res.end(JSON.stringify(body))

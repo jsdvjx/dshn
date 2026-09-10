@@ -1,11 +1,16 @@
 # Bundle layer contributed by dshn-agent.
 #
 # Just the host-half row. There is deliberately NO `connection.trustedHosts`
-# override any more: the agent replays every forwarded request to local dsh with
-# Host/Origin rewritten to loopback, so dsh's /api trust fence accepts it as a
-# local, same-origin request for ANY public subdomain. That is what lets the
-# subdomain be chosen at runtime in the setup dialog instead of baked into the
-# composition — and access is gated by the relay's login, not the fence.
+# override: the agent replays every forwarded request to local dsh with
+# Host/Origin rewritten to loopback AND stamped with dsh's own browser-session
+# cookie, so dsh's /api fence accepts it as a local, same-origin, authenticated
+# request for ANY public subdomain. That is what lets the subdomain be chosen at
+# runtime in the setup dialog instead of baked into the composition — and access
+# is gated by the relay's login, not the fence.
+#
+# The row injects `webServer` and `settings`. dsh's `connection` service (the
+# source of the session cookie, on dsh >= 0.1.2) is read through an OPTIONAL
+# injection in code instead, so this plugin still loads on a dsh that has none.
 #
 # No credentials live here either: the user sets subdomain + password in the UI
 # (POST /dshn/configure), and they persist to DSHN_STATE. Only infrastructure is

@@ -1,6 +1,6 @@
 {
   "name": "@dshn/agent",
-  "version": "0.3.5",
+  "version": "0.4.0",
   "description": "Forward this machine's local DeepSeek Harness (dsh) web service to the public internet over ds.hn: an outbound WSS tunnel to the relay, plus the trust-fence integration that lets forwarded requests through.",
   "keywords": [
     "dsh",
@@ -39,7 +39,6 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-ui-layout"
       ]
     }
@@ -52,6 +51,6 @@
     "@deepseek-ai/cordis": "*"
   },
   "devDependencies": {
-    "@deepseek-ai/schemastery": "3.18.1"
+    "@deepseek-ai/schemastery": "3.18.2"
   }
 }
